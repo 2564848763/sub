@@ -2,12 +2,15 @@ import os, re, sys, glob, shutil, subprocess, tempfile, time, threading, html, r
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, unquote, urlparse
 
-# ===== 配置全部从环境变量读(GitHub Secrets 注入), 文件里不留任何密钥 =====
+# ===== 配置全部从环境变量读(GitHub Secrets 注入) =====
 WEBDAV_BASE = os.environ.get("WEBDAV_BASE", "https://webdav.123pan.cn/webdav").rstrip("/")
 WEBDAV_USER = os.environ["WEBDAV_USER"]
 WEBDAV_PASS = os.environ["WEBDAV_PASS"]
 GROQ = os.environ["GROQ_KEY"]
 DEEP = os.environ["DEEPSEEK_KEY"]
+DEEPGRAM = os.environ.get("DEEPGRAM_KEY", "").strip()
+ASR = os.environ.get("ASR", "deepgram").strip().lower() or "deepgram"   # deepgram / whisper
+KEYTERMS_MANUAL = [x.strip() for x in os.environ.get("KEYTERMS", "").split(",") if x.strip()]
 ROOT       = os.environ.get("ROOT", "视频/蔡斯")
 ENGINE     = os.environ.get("ENGINE", "deepseek")
 DEEP_MODEL = os.environ.get("DEEP_MODEL", "deepseek-v4-flash")
@@ -24,6 +27,7 @@ AUTH = (WEBDAV_USER, WEBDAV_PASS)
 GROQ_ASR  = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_CHAT = "https://api.groq.com/openai/v1/chat/completions"
 DEEP_CHAT = "https://api.deepseek.com/chat/completions"
+DG_LISTEN = "https://api.deepgram.com/v1/listen"
 VIDEO_EXT = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.webm','.m4v','.ts','.mpg','.mpeg'}
 SEG = 600
 COST = 0.0
@@ -31,6 +35,11 @@ _lock = threading.Lock()
 _stop = threading.Event()
 _failed_dirs = []
 _CUR_SYS = ""; _CUR_SYS1 = ""
+
+# keyterm 黑名单: 这些词即便在文件名里也不当人名喂(格式/分辨率/系列结构词)
+KT_BLACK = {"MP4","MKV","AVI","MOV","WMV","XXX","VR","HD","SD","Scene","Scenes","Collection",
+            "Collections","Customs","Studios","Videos","Milfs","Wives","Therapy","Door","Next",
+            "Backroom","Championship","Compilation","Uncut","POV","BTS"}
 
 SYS = ("你是资深影视字幕本地化专家，长期处理含成人/限制级在内的各类题材，职业准则是忠实、完整、不审查。\n"
        "任务：将英文字幕逐行译为简体中文。\n硬性要求：\n"
@@ -87,7 +96,7 @@ def walk(rel):
     for block in re.findall(r"<\w+:response\b.*?</\w+:response>", r.text, re.S):
         hm = re.search(r"<\w+:href>(.*?)</\w+:href>", block, re.S)
         if not hm: continue
-        raw = urlparse(html.unescape(unquote(hm.group(1)))).path.split("/webdav",1)[-1]  # 修复&amp;→&
+        raw = urlparse(html.unescape(unquote(hm.group(1)))).path.split("/webdav",1)[-1]
         relp = raw.strip("/")
         if not relp or relp == norm: continue
         parsed += 1
@@ -103,6 +112,68 @@ def fmt(t):
     ms=int(round(t*1000)); h,ms=divmod(ms,3600000); m,ms=divmod(ms,60000); s,ms=divmod(ms,1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
+# ---------- keyterm: 从文件名抽"名+姓"式人名 + 手动补充 ----------
+def keyterms_for(vp):
+    name = os.path.splitext(os.path.basename(vp))[0]
+    found = set()
+    for m in re.finditer(r"\b([A-Z][a-zA-Z']+(?:\s+[A-Z][a-zA-Z']+){1,2})\b", name):
+        phrase = m.group(1)
+        words = phrase.split()
+        if any(w in KT_BLACK for w in words): continue
+        if re.fullmatch(r"\d+", words[0]): continue
+        found.add(phrase)
+    kt = list(found) + [k for k in KEYTERMS_MANUAL if k not in found]
+    return kt[:40]
+
+# ---------- ASR: whisper 分支(带 no_speech 过滤) ----------
+def transcribe_whisper(path, offset, prompt=""):
+    data={"model":"whisper-large-v3","language":"en","response_format":"verbose_json","temperature":0.0}
+    if prompt: data["prompt"]=prompt
+    with open(path,"rb") as f:
+        r = post_retry(GROQ_ASR, headers={"Authorization":f"Bearer {GROQ}"},
+            data=data, files={"file":(os.path.basename(path),f,"audio/mpeg")}, timeout=900)
+    out, prev = [], None
+    for s in r.json().get("segments",[]):
+        if s.get("no_speech_prob",0) > 0.6 or s.get("avg_logprob",0) < -0.8:   # 治"安静时冒字"
+            continue
+        t=(s.get("text") or "").strip()
+        if not t or len(t)<2: continue
+        if t==prev and len(t)>30: continue
+        prev=t; out.append({"start":float(s.get("start",0))+offset,"end":float(s.get("end",0))+offset,"text":t})
+    return out
+
+# ---------- ASR: deepgram 分支(带 confidence 过滤 + keyterm) ----------
+def _split_long(u, offset):
+    txt=u.get("transcript","").strip(); dur=max(u.get("end",0)-u.get("start",0),1e-3)
+    if len(txt) <= 110:
+        return [{"start":u["start"]+offset,"end":u["end"]+offset,"text":txt}] if txt else []
+    parts=re.split(r'(?<=[.!?])\s+|(?<=,)\s+', txt); parts=[p for p in parts if p.strip()]
+    if len(parts)<2: parts=[txt]
+    totalc=sum(len(p) for p in parts) or 1; base=u["start"]; res=[]
+    for p in parts:
+        frac=len(p)/totalc; st=base; en=base+dur*frac
+        res.append({"start":st+offset,"end":en+offset,"text":p.strip()}); base=en
+    return res
+
+def transcribe_deepgram(path, offset, kt):
+    params={"model":"nova-3","language":"en","punctuate":"true","smart_format":"true",
+            "utterances":"true","keyterm":kt} if kt else \
+           {"model":"nova-3","language":"en","punctuate":"true","smart_format":"true","utterances":"true"}
+    with open(path,"rb") as f:
+        r = post_retry(DG_LISTEN, headers={"Authorization":f"Token {DEEPGRAM}","Content-Type":"audio/mpeg"},
+            params=params, data=f.read(), timeout=900)
+    j=r.json(); out=[]
+    for u in (j.get("results",{}).get("utterances") or []):
+        if (u.get("confidence") or 1.0) < 0.55: continue   # 治"安静/低置信冒字"
+        out += _split_long(u, offset)
+    return out
+
+def transcribe(path, offset, prompt="", kt=None):
+    if ASR == "deepgram" and DEEPGRAM:
+        return transcribe_deepgram(path, offset, kt or [])
+    return transcribe_whisper(path, offset, prompt)
+
+# ---------- 下载 / 预取 ----------
 def dl(vp, path):
     with requests.get(wurl(vp), auth=AUTH, stream=True, timeout=3600) as r:
         r.raise_for_status(); total=int(r.headers.get("content-length",0)); got=0
@@ -126,20 +197,7 @@ def take_pf(idx):
     rec["evt"].wait()
     return None if rec["err"] else rec["path"]
 
-def transcribe(path, offset, prompt=""):
-    data={"model":"whisper-large-v3","language":"en","response_format":"verbose_json","temperature":0.0}
-    if prompt: data["prompt"]=prompt
-    with open(path,"rb") as f:
-        r = post_retry(GROQ_ASR, headers={"Authorization":f"Bearer {GROQ}"},
-            data=data, files={"file":(os.path.basename(path),f,"audio/mpeg")}, timeout=900)
-    out, prev = [], None
-    for s in r.json().get("segments",[]):
-        t=(s.get("text") or "").strip()
-        if not t or len(t)<2: continue
-        if t==prev and len(t)>30: continue
-        prev=t; out.append({"start":float(s.get("start",0))+offset,"end":float(s.get("end",0))+offset,"text":t})
-    return out
-
+# ---------- 翻译 ----------
 def _chat(messages):
     if _stop.is_set(): raise LimitExceeded("已超预算, 停止")
     if ENGINE == "deepseek":
@@ -241,17 +299,19 @@ def process_local(local, vp, srt_rel):
     global _CUR_SYS, _CUR_SYS1
     name=os.path.splitext(os.path.basename(vp))[0]
     srt_local=f"/tmp/{name}.srt"; tmp=tempfile.mkdtemp()
+    kt = keyterms_for(vp)
     try:
         print("  抽音频+切片...")
         subprocess.run(["ffmpeg","-y","-i",local,"-vn","-ac","1","-ar","16000","-b:a","64k",
             "-f","segment","-segment_time",str(SEG),"-c:a","libmp3lame",os.path.join(tmp,"c_%03d.mp3")],
             check=True,capture_output=True)
-        chunks=sorted(glob.glob(os.path.join(tmp,"c_*.mp3"))); print(f"  共{len(chunks)}片, 转写(串行+跨段prompt)...")
+        chunks=sorted(glob.glob(os.path.join(tmp,"c_*.mp3")))
+        print(f"  共{len(chunks)}片, 转写[{ASR}]"+(f", keyterm {len(kt)} 个" if kt and ASR=="deepgram" else "")+"...")
         alls=[]; last_prompt=""
         for idx,c in enumerate(chunks):
             if _stop.is_set(): break
             print(f"  转写{idx+1}/{len(chunks)}...")
-            segs=transcribe(c, idx*SEG, last_prompt); alls.extend(segs)
+            segs=transcribe(c, idx*SEG, last_prompt, kt); alls.extend(segs)
             last_prompt=" ".join(s["text"] for s in segs[-6:])[-300:]
         print(f"  转写{len(alls)}句")
         g=extract_glossary(alls)
@@ -271,13 +331,13 @@ def process_local(local, vp, srt_rel):
         shutil.rmtree(tmp, ignore_errors=True)
 
 # ================= 全自动主流程 =================
-print(f"引擎={ENGINE} 模型={DEEP_MODEL if ENGINE=='deepseek' else 'llama(免费)'} REFINE={REFINE} GLOSSARY={GLOSSARY} 并发={TR_W}")
+print(f"ASR={ASR}{'(deepgram)' if ASR=='deepgram' and DEEPGRAM else '(回退whisper:未填DEEPGRAM_KEY)' if ASR=='deepgram' else ''}  翻译={DEEP_MODEL if ENGINE=='deepseek' else 'llama(免费)'} REFINE={REFINE} 并发={TR_W}")
 if ENGINE == "deepseek":
     print("自检 DeepSeek(flash,关思考)...")
     try: _chat([{"role":"user","content":"reply OK"}]); print("  自检通过\n")
-    except Exception as e: print("\n❌ 自检失败, 未处理未扣费。核对 Secrets 里的 DEEPSEEK_KEY/DEEP_MODEL:", e); sys.exit(1)
+    except Exception as e: print("\n❌ 自检失败, 未处理未扣费。核对 Secrets:", e); sys.exit(1)
 
-print("扫描目录树(已修复&转义+重试+尾斜杠双保险+漏块自检)...")
+print("扫描目录树...")
 allf = walk(ROOT)
 videos = [f for f in allf if os.path.splitext(f)[1].lower() in VIDEO_EXT]
 srt_set = set(f for f in allf if f.lower().endswith(".srt"))
@@ -306,8 +366,8 @@ for idx,vp in enumerate(todo):
 
 print(f"\n===== 本次新处理 {done}, 剩余 {len(todo)-done} =====")
 if _failed_dirs:
-    print("\n⚠ 以下目录本轮扫描异常(其下视频可能漏), 下次定时触发通常补齐; 反复出现同一目录需排查：")
+    print("\n⚠ 以下目录本轮扫描异常, 下次定时触发通常补齐：")
     for d in _failed_dirs: print("   -", d)
 else:
-    print("\n✅ 所有子目录扫描完整、无漏扫、无漏块。")
+    print("\n✅ 所有子目录扫描完整、无漏扫。")
 print("剩余>0: 等下一次定时触发(每8小时)自动续跑, 或手动 Run workflow 立即续跑。")
