@@ -7,21 +7,23 @@ on:
         description: '临时指定目录(留空=用Secrets里的ROOT)'
         default: ''
   schedule:
-    - cron: '0 */8 * * *'   # 每8小时自动跑一次(公开仓库分钟无限)
+    - cron: '0 */8 * * *'
 
 concurrency:
   group: subtitle
-  cancel-in-progress: false   # 同一时间只跑一个, 新的排队, 不打断正在跑的
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 350      # 单次最长约6小时, 到点自动停, 下次定时接着跑
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: pip install -q requests
       - name: run subtitle
         env:
