@@ -34,6 +34,9 @@ jobs:
           DEEPGRAM_KEY: ${{ secrets.DEEPGRAM_KEY }}
           ASR: ${{ secrets.ASR }}
           KEYTERMS: ${{ secrets.KEYTERMS }}
+          ITALIC_SFX: ${{ secrets.ITALIC_SFX }}
+          CTX_VIEW: ${{ secrets.CTX_VIEW }}
+          CTX_MAP: ${{ secrets.CTX_MAP }}
           ROOT: ${{ github.event.inputs.root || secrets.ROOT }}
           ENGINE: deepseek
           REFINE: 'false'
