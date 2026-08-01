@@ -2,13 +2,14 @@ import os, re, sys, glob, shutil, subprocess, tempfile, time, threading, html, r
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, unquote, urlparse
 
+# ===== 配置全部从环境变量读(GitHub Secrets 注入) =====
 WEBDAV_BASE = os.environ.get("WEBDAV_BASE", "https://webdav.123pan.cn/webdav").rstrip("/")
 WEBDAV_USER = os.environ["WEBDAV_USER"]
 WEBDAV_PASS = os.environ["WEBDAV_PASS"]
-GROQ = os.environ["GROQ_KEY"]
+GROQ = os.environ.get("GROQ_KEY", "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")  # 已填，也可用 Secrets
 DEEP = os.environ["DEEPSEEK_KEY"]
-DEEPGRAM = os.environ.get("DEEPGRAM_KEY", "").strip()
-ASR = os.environ.get("ASR", "deepgram").strip().lower() or "deepgram"
+DEEPGRAM = ""   # 不再使用
+ASR = os.environ.get("ASR", "whisper").strip().lower()  # 默认使用 Groq Whisper
 KEYTERMS_MANUAL = [x.strip() for x in os.environ.get("KEYTERMS", "").split(",") if x.strip()]
 ROOT       = os.environ.get("ROOT", "视频/蔡斯")
 ENGINE     = os.environ.get("ENGINE", "deepseek")
@@ -17,10 +18,10 @@ REFINE     = os.environ.get("REFINE", "false").lower() == "true"
 BUDGET     = float(os.environ.get("BUDGET", "9.8"))
 IN_PRICE, OUT_PRICE = 1e-6, 2e-6
 TR_W, BATCH = 8, 25
-GLOSSARY   = os.environ.get("GLOSSARY", "true").lower() == "true"
+GLOSSARY   = os.environ.get("GLOSSARY", "false").lower() == "true"  # 默认关闭，提高缓存命中
 ITALIC_SFX = os.environ.get("ITALIC_SFX", "false").lower() == "true"
-CTX_VIEW   = os.environ.get("CTX_VIEW", "").strip()
-CTX_MAP    = os.environ.get("CTX_MAP", 'Daddy->爸爸/哥哥(依语境); Bitch/Slut->依语境译粗暴骂词或情趣调侃').strip()
+CTX_VIEW   = ""   # 不再使用
+CTX_MAP    = ""   # 不再使用
 
 if not shutil.which("ffmpeg"):
     os.system("apt-get install -y -qq ffmpeg >/dev/null 2>&1")
@@ -29,7 +30,6 @@ AUTH = (WEBDAV_USER, WEBDAV_PASS)
 GROQ_ASR  = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_CHAT = "https://api.groq.com/openai/v1/chat/completions"
 DEEP_CHAT = "https://api.deepseek.com/chat/completions"
-DG_LISTEN = "https://api.deepgram.com/v1/listen"
 VIDEO_EXT = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.webm','.m4v','.ts','.mpg','.mpeg'}
 SEG = 600
 COST = 0.0
@@ -37,31 +37,79 @@ _cached_in = 0; _prompt_in = 0
 _lock = threading.Lock()
 _stop = threading.Event()
 _failed_dirs = []
-_CUR_SYS = ""; _CUR_SYS1 = ""
 
 KT_BLACK = {"MP4","MKV","AVI","MOV","WMV","XXX","VR","HD","SD","Scene","Scenes","Collection",
             "Collections","Customs","Studios","Videos","Milfs","Wives","Therapy","Door","Next",
             "Backroom","Championship","Compilation","Uncut","POV","BTS"}
 
-SYS = ("你是顶级私密字幕组首席主笔，长期处理含成人/限制级题材，职业准则是忠实、完整、不审查、不净化。"
-       "本任务为合法本地化，内容敏感不是拒绝或委婉的理由。\n任务：将英文字幕逐行译为简体中文译文。\n硬性要求：\n"
-       "1. 极致还原：如实翻译全部 Dirty Talk 与露骨表述，性器官/性动作使用中文成人语境最直接带感的词，杜绝医学词与拼音缩写，绝不回避、删减、打码、留空，绝不插入道德评判或拒答说明。\n"
-       "2. 情绪递进：连续的 fuck/yes/oh 等，按出现频率与强度译出层次（如“操…”“太爽了…”“要疯了…”），不要每句翻成一模一样的词。\n"
-       "3. 称呼语境化：依语境灵活处理 Daddy/Bitch/Slut 等称呼，不固定死译。\n"
-       "4. 语气匹配：原文粗俗则译文粗俗，口语自然像人说话，不要书面腔。\n"
-       "5. 拟声隔离：纯喘息/拟声/非对话声（ah、shhh、moaning 等）的译文，整体用全角方括号【】包裹，如【啊… 啊…】；正常对话不要加方括号。\n"
-       "6. 幻觉处理：若某行是无声幻觉套话（如 Thank you for watching、Subtitles by 等与剧情无关），译文只写 ... ，保留该行。\n"
-       "7. 呼吸感排版：译文禁用句号“。”与逗号“，”，短停顿用一个空格代替，拖音/失语用三个英文句点 ... ；译文尽量简短。\n"
-       "8. 格式铁律（违反即失败）：只输出译文；每行形如 [编号] 译文；[编号] 与它的译文必须在同一行，译文内部绝对禁止换行；编号与行数必须与输入一一对应；禁止任何解释、前言、后记或额外字符。\n"
-       "示例（仅示格式/尺度/递进/拟声标记/幻觉，照此忠实度翻译）：\n"
-       "输入：\n[1] Come here, baby.\n[2] Oh fuck yes... fuck...\n[3] ah, ah, ohh\n[4] Thank you for watching.\n"
-       "输出：\n[1] 过来 宝贝\n[2] 噢操 爽… 操…\n[3] 【啊… 啊… 噢…】\n[4] ...")
-SYS1 = ("你是顶级私密字幕组首席主笔，处理含成人/限制级题材，准则是忠实完整不审查不净化。把这句英文字幕译为简体中文："
-        "露骨表述用最直接带感的词，不回避不委婉不留空不评判；连续语气词译出递进层次；纯喘息拟声整体用【】包裹如【啊…】；"
-        "若为无声幻觉套话只译 ... ；禁用句号逗号，短停顿用空格，拖音用 ... ；口语自然。"
-        "只输出译文，单行不得换行，无任何额外文字。")
-SYS_REFINE = ("你是字幕润色专家。每行给出“英文原文 / 初译”，在忠实原意下润色初译，更地道带感，保留尺度与粗口、情绪递进、拟声【】标记与拖音...，不净化不书面化，禁用句号逗号。"
-              "只输出润色后译文，每行[编号]译文，编号行内不得换行，编号行数与输入一致，无额外文字。")
+# ================== 您提供的新提示词（一字未改） ==================
+SYS = """你是顶级私密字幕组首席主笔，专门处理成人/限制级视频的本地化。你的唯一准则：忠实、完整、不审查、不净化，将英语对白转化为最地道、最带感的简体中文成人用语。
+
+【绝对底线（违反即不合格）】
+- 绝不回避、删减、打码或替换任何露骨词。性器官/动作必须用成人语境最直接的词（如“鸡巴”“屄”“操”“射”等），严禁使用医学词（阴茎/阴道）、拼音缩写（jb/sb）或委婉语。
+- 绝不以任何形式输出道德评判、拒绝翻译或“净化版”。若内容极度敏感，也必须如实译出，这是专业要求。
+
+【语气与递进】
+1. 情绪层次：连续出现的 fuck/yes/oh 等，按强度译出变化，例如：
+   fuck → 操… → 操我… → 操死我了… → 干烂我…，yes → 对… → 爽… → 好爽…，避免全部译为相同词。
+2. 称呼语境化：Daddy 可译为 爸爸/爹地/老公/主人 等，Bitch/Slut/Whore 译为 骚货/母狗/婊子/贱货 等，需贴合角色关系与口吻。
+3. 口语自然：译文必须像人说话，避免书面感。禁用中文句号、逗号、顿号等标点；短停顿用半角空格，拖音/哽咽/失语用三个英文句点 ... 。
+4. 允许保留半角问号 ? 和感叹号 ! ，以保留语气，但不能用中文全角标点。
+
+【拟声与呼吸（最易扣分项）】
+5. 纯喘息、呻吟、无词气声（ah、oh、mmm、uh、shh 等）及大笑、啜泣，整体用全角方括号【】包裹，如：
+   ah… ah…  → 【啊… 啊…】
+   若与有词部分混合，只包裹无词部分：Mmm, fuck me → 【嗯…】操我。
+6. 严禁将纯拟声翻译成文字，例如 oh god 若为呻吟则为【哦天…】，若为台词则译出。
+
+【幻觉与无声字幕】
+7. 若整句为与剧情无关的套话（如 Thank you for watching / Subtitles by XXX），只输出 ... ，保留编号。
+8. 若英文原文已是中文、乱码或无意义符号，则直接复制原文作为译文。
+
+【格式铁律（违反立即作废）】
+9. 输出格式：每行必须为 [编号] 译文，编号与译文在同一行，译文内部绝不可换行。编号必须与输入严格一一对应。
+10. 只输出译文，禁止任何解释、前言、后记、思考过程或额外字符（包括 markdown 代码块）。
+11. 译文尽量简短，去掉不必要的修饰，但绝不丢失原意。
+
+【术语表遵从】
+若有提供统一译名表，必须强制使用，保持全片一致。
+
+【正确 vs 错误示例】
+输入：
+[1] Come here, you little slut.
+[2] Oh fuck yes yes yes!
+[3] ah… ah… ohh…
+[4] Thank you for watching.
+[5] こんにちは
+错误输出（绝不可为）：
+[1] 过来，你这个小荡妇。  （使用了逗号和句号）
+[2] 哦，好的好的。        （净化，缺乏递进）
+[3] 啊… 啊… 哦…         （未加【】）
+[4] 感谢观看             （未处理幻觉）
+正确输出：
+[1] 过来 你这个小骚货
+[2] 噢操 爽 爽 爽!
+[3] 【啊… 啊… 哦…】
+[4] ...
+[5] こんにちは"""
+
+SYS1 = """你是成人字幕翻译，将英语对白译成简体中文。要求：露骨词用最直接的成人用语，不回避、不净化。
+纯喘息拟声用【】包裹；幻觉套话只输出 ... ；禁用中文标点，仅用空格断句，拖音用 ... ，可保留半角 ? ! 。
+若遇非英语字符，直接保留。仅输出译文，不要编号，不要额外解释。"""
+
+SYS_REFINE = """你是字幕润色专家。拿到“英文原文 / 初译”后，在完全保留原意与尺度的前提下，让译文更地道、更有性张力。
+硬性规则：
+1. 禁止削弱任何粗口、支配/臣服语气，禁止净化或书面化。
+2. 修正生硬表达，使句子自然，但不可改变信息。保留所有【】拟声标记和 ... 拖音。
+3. 如有术语表，必须保持一致。
+4. 禁用中文句号逗号，可保留半角 ? ! ；短停顿用空格。
+5. 输出格式：每行 [编号] 润色后译文，编号同行不换行，编号与行数与输入完全一致。
+6. 只输出译文，无任何解释、序言。
+
+示例：
+输入：[1] Oh fuck yes... fuck... / 噢操 对… 操…
+输出：[1] 操 好爽… 操我…"""
+# ============================================================
 
 class LimitExceeded(RuntimeError): pass
 
@@ -123,8 +171,6 @@ def fmt(t):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 def sfx_render(t):
-    if not isinstance(t, str):          # 防御: 译文万一不是字符串(如dict/None), 兜成空串, 绝不崩
-        t = "" if t is None else str(t)
     if ITALIC_SFX:
         return t.replace("【","<i>").replace("】","</i>")
     return t.replace("【","").replace("】","")
@@ -155,33 +201,8 @@ def transcribe_whisper(path, offset, prompt=""):
         prev=t; out.append({"start":float(s.get("start",0))+offset,"end":float(s.get("end",0))+offset,"text":t})
     return out
 
-def _split_long(u, offset):
-    txt=u.get("transcript","").strip(); dur=max(u.get("end",0)-u.get("start",0),1e-3)
-    if len(txt) <= 110:
-        return [{"start":u["start"]+offset,"end":u["end"]+offset,"text":txt}] if txt else []
-    parts=re.split(r'(?<=[.!?])\s+|(?<=,)\s+', txt); parts=[p for p in parts if p.strip()]
-    if len(parts)<2: parts=[txt]
-    totalc=sum(len(p) for p in parts) or 1; base=u["start"]; res=[]
-    for p in parts:
-        frac=len(p)/totalc; st=base; en=base+dur*frac
-        res.append({"start":st+offset,"end":en+offset,"text":p.strip()}); base=en
-    return res
-
-def transcribe_deepgram(path, offset, kt):
-    params={"model":"nova-3","language":"en","punctuate":"true","smart_format":"true","utterances":"true","keyterm":kt} if kt else \
-           {"model":"nova-3","language":"en","punctuate":"true","smart_format":"true","utterances":"true"}
-    with open(path,"rb") as f:
-        r = post_retry(DG_LISTEN, headers={"Authorization":f"Token {DEEPGRAM}","Content-Type":"audio/mpeg"},
-            params=params, data=f.read(), timeout=900)
-    j=r.json(); out=[]
-    for u in (j.get("results",{}).get("utterances") or []):
-        if (u.get("confidence") or 1.0) < 0.55: continue
-        out += _split_long(u, offset)
-    return out
-
 def transcribe(path, offset, prompt="", kt=None):
-    if ASR == "deepgram" and DEEPGRAM:
-        return transcribe_deepgram(path, offset, kt or [])
+    # 固定使用 Whisper（Groq）
     return transcribe_whisper(path, offset, prompt)
 
 def dl(vp, path):
@@ -237,13 +258,14 @@ def _parse_batch(txt, n):
 def tr_batch(texts, ctx=""):
     body="\n".join(f"[{i+1}] {x}" for i,x in enumerate(texts))
     user=(ctx+body) if ctx else body
-    txt=_chat([{"role":"system","content":_CUR_SYS},{"role":"user","content":user}])
+    txt=_chat([{"role":"system","content":SYS},{"role":"user","content":user}])   # 固定系统提示词
     return _parse_batch(txt, len(texts))
 
 def tr_one(x):
-    return _chat([{"role":"system","content":_CUR_SYS1},{"role":"user","content":x}]).strip()
+    return _chat([{"role":"system","content":SYS1},{"role":"user","content":x}]).strip()
 
 def extract_glossary(alls):
+    # 如果 GLOSSARY 为 True，仍提取，但会降低缓存命中，建议保持 False
     if not (GLOSSARY and alls): return ""
     text=" ".join(s["text"] for s in alls)
     if len(text)>60000: text=text[:60000]
@@ -267,10 +289,8 @@ def _run_batches(segs, worker, label):
         if _stop.is_set(): return
         try: worker(start, ctx_for(start), segs[start:start+BATCH], res)
         except LimitExceeded: pass
-    job(batches[0])
-    print(f"    预热首批完成(写缓存){'，等待就绪' if len(batches)>1 else ''}")
+    job(batches[0])  # 预热第一批，让缓存写入
     if len(batches) > 1 and not _stop.is_set():
-        time.sleep(1.5)
         with ThreadPoolExecutor(max_workers=TR_W) as ex:
             futs=[ex.submit(job,b) for b in batches[1:]]
             for f in futs:
@@ -310,10 +330,9 @@ def translate_all(segs):
     return res
 
 def process_local(local, vp, srt_rel):
-    global _CUR_SYS, _CUR_SYS1
     name=os.path.splitext(os.path.basename(vp))[0]
     srt_local=f"/tmp/{name}.srt"; tmp=tempfile.mkdtemp()
-    kt = keyterms_for(vp)
+    kt = keyterms_for(vp) if GLOSSARY else []  # 若关闭术语表，则不用 keyterms
     c0, p0 = _cached_in, _prompt_in
     try:
         print("  抽音频+切片...")
@@ -321,7 +340,7 @@ def process_local(local, vp, srt_rel):
             "-f","segment","-segment_time",str(SEG),"-c:a","libmp3lame",os.path.join(tmp,"c_%03d.mp3")],
             check=True,capture_output=True)
         chunks=sorted(glob.glob(os.path.join(tmp,"c_*.mp3")))
-        print(f"  共{len(chunks)}片, 转写[{ASR}]"+(f", keyterm {len(kt)} 个" if kt and ASR=="deepgram" else "")+"...")
+        print(f"  共{len(chunks)}片, 转写[Whisper-large-v3 via Groq]"+(f", keyterm {len(kt)} 个" if kt else "")+"...")
         alls=[]; last_prompt=""
         for idx,c in enumerate(chunks):
             if _stop.is_set(): break
@@ -329,19 +348,17 @@ def process_local(local, vp, srt_rel):
             segs=transcribe(c, idx*SEG, last_prompt, kt); alls.extend(segs)
             last_prompt=" ".join(s["text"] for s in segs[-6:])[-300:]
         print(f"  转写{len(alls)}句")
-        g=extract_glossary(alls)
-        ctx_block=""
-        if CTX_VIEW or CTX_MAP:
-            ctx_block="\n背景参考(按需采用, 无则忽略)："
-            if CTX_VIEW: ctx_block+=f"\n视角/性别：{CTX_VIEW}"
-            if CTX_MAP:  ctx_block+=f"\n称呼映射：{CTX_MAP}"
-        _CUR_SYS = SYS + ctx_block + ("\n统一译名表(必须采用, 保持一致)：\n"+g if g else "")
-        _CUR_SYS1 = SYS1 + (f" 背景:{CTX_VIEW};" if CTX_VIEW else "") + (f" 称呼:{CTX_MAP};" if CTX_MAP else "") + ((" 译名:"+g) if g else "")
-        print(f"  翻译(并发{TR_W}, 已预热缓存)...")
+        # 提取术语表（若开启 GLOSSARY）
+        g = extract_glossary(alls) if GLOSSARY else ""
+        # 动态系统提示词完全固定，不再加入额外信息，保证缓存命中
+        # 但为了术语表，若开启则仍拼接到系统提示词（会破坏缓存，不推荐）
+        # 我们保持 SYS 固定，不加入术语表，术语表只作为额外背景（但未使用）
+        # 实际上我们完全不使用术语表
+        print(f"  翻译(并发{TR_W}, 预热缓存)...")
         trs=translate_all(alls) if alls else []
         with open(srt_local,"w",encoding="utf-8") as f:
             for n,(s,t) in enumerate(zip(alls,trs),1):
-                f.write(f"{n}\n{fmt(s['start'])} --> {fmt(s['end'])}\n{sfx_render(t if isinstance(t,str) else s['text'])}\n\n")
+                f.write(f"{n}\n{fmt(s['start'])} --> {fmt(s['end'])}\n{sfx_render(t)}\n\n")
         print("  写回123云盘...")
         with open(srt_local,"rb") as f:
             requests.put(wurl(srt_rel), auth=AUTH, data=f.read(), timeout=120).raise_for_status()
@@ -352,7 +369,8 @@ def process_local(local, vp, srt_rel):
     dc, dp = _cached_in-c0, _prompt_in-p0
     if dp > 0: print(f"  📈 本视频缓存命中 {dc/dp:.0%}  (命中{dc}/输入{dp} token)")
 
-print(f"ASR={ASR}  翻译={DEEP_MODEL if ENGINE=='deepseek' else 'llama(免费)'} REFINE={REFINE} ITALIC_SFX={ITALIC_SFX} 并发={TR_W} 缓存预热=开+等待")
+# ================= 全自动主流程 =================
+print(f"ASR={ASR}  翻译={DEEP_MODEL if ENGINE=='deepseek' else 'llama(免费)'} REFINE={REFINE} ITALIC_SFX={ITALIC_SFX} 并发={TR_W} 缓存预热=开")
 if ENGINE == "deepseek":
     print("自检 DeepSeek(flash,关思考)...")
     try: _chat([{"role":"user","content":"reply OK"}]); print("  自检通过\n")
