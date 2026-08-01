@@ -2,27 +2,34 @@ import os, re, sys, glob, shutil, subprocess, tempfile, time, threading, html, r
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, unquote, urlparse
 
-# ===== 配置全部从环境变量读(GitHub Secrets 注入) =====
-WEBDAV_BASE = os.environ.get("WEBDAV_BASE", "https://webdav.123pan.cn/webdav").rstrip("/")
-WEBDAV_USER = os.environ["WEBDAV_USER"]
-WEBDAV_PASS = os.environ["WEBDAV_PASS"]
-GROQ = os.environ.get("GROQ_KEY", "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")  # 已填，也可用 Secrets
-DEEP = os.environ["DEEPSEEK_KEY"]
-DEEPGRAM = ""   # 不再使用
-ASR = os.environ.get("ASR", "whisper").strip().lower()  # 默认使用 Groq Whisper
-KEYTERMS_MANUAL = [x.strip() for x in os.environ.get("KEYTERMS", "").split(",") if x.strip()]
-ROOT       = os.environ.get("ROOT", "视频/蔡斯")
-ENGINE     = os.environ.get("ENGINE", "deepseek")
-DEEP_MODEL = os.environ.get("DEEP_MODEL", "deepseek-v4-flash")
-REFINE     = os.environ.get("REFINE", "false").lower() == "true"
-BUDGET     = float(os.environ.get("BUDGET", "9.8"))
-IN_PRICE, OUT_PRICE = 1e-6, 2e-6
-TR_W, BATCH = 8, 25
-GLOSSARY   = os.environ.get("GLOSSARY", "false").lower() == "true"  # 默认关闭，提高缓存命中
-ITALIC_SFX = os.environ.get("ITALIC_SFX", "false").lower() == "true"
-CTX_VIEW   = ""   # 不再使用
-CTX_MAP    = ""   # 不再使用
+# ===== 所有敏感信息强制从环境变量读取 =====
+def _get_env(var, required=True, default=None):
+    val = os.environ.get(var, default)
+    if required and val is None:
+        sys.exit(f"❌ 错误：未设置环境变量 {var}")
+    return val
 
+WEBDAV_BASE = _get_env("WEBDAV_BASE", required=False, default="https://webdav.123pan.cn/webdav").rstrip("/")
+WEBDAV_USER = _get_env("WEBDAV_USER", required=True)
+WEBDAV_PASS = _get_env("WEBDAV_PASS", required=True)
+DEEP        = _get_env("DEEPSEEK_KEY", required=True)
+ROOT        = _get_env("ROOT", required=False, default="视频/蔡斯")
+ENGINE      = _get_env("ENGINE", required=False, default="deepseek")
+DEEP_MODEL  = _get_env("DEEP_MODEL", required=False, default="deepseek-v4-flash")
+ASR         = _get_env("ASR", required=False, default="mimo")
+REFINE      = _get_env("REFINE", required=False, default="false").lower() == "true"
+BUDGET      = float(_get_env("BUDGET", required=False, default="9.8"))
+IN_PRICE, OUT_PRICE = 1e-6, 2e-6
+TR_W, BATCH = 4, 25
+GLOSSARY    = _get_env("GLOSSARY", required=False, default="false").lower() == "true"
+ITALIC_SFX  = _get_env("ITALIC_SFX", required=False, default="false").lower() == "true"
+
+MIMO_API_KEY = _get_env("MIMO_API_KEY", required=True)
+MIMO_BASE_URL = _get_env("MIMO_BASE_URL", required=False, default="https://api.mimo.mi.com/v1")
+
+GROQ_FALLBACK_KEY = os.environ.get("GROQ_KEY", "")   # 可选回退
+
+# 自动安装 ffmpeg
 if not shutil.which("ffmpeg"):
     os.system("apt-get install -y -qq ffmpeg >/dev/null 2>&1")
 
@@ -42,7 +49,7 @@ KT_BLACK = {"MP4","MKV","AVI","MOV","WMV","XXX","VR","HD","SD","Scene","Scenes",
             "Collections","Customs","Studios","Videos","Milfs","Wives","Therapy","Door","Next",
             "Backroom","Championship","Compilation","Uncut","POV","BTS"}
 
-# ================== 您提供的新提示词（一字未改） ==================
+# ================== 系统提示词（固定，提升缓存命中） ==================
 SYS = """你是顶级私密字幕组首席主笔，专门处理成人/限制级视频的本地化。你的唯一准则：忠实、完整、不审查、不净化，将英语对白转化为最地道、最带感的简体中文成人用语。
 
 【绝对底线（违反即不合格）】
@@ -109,6 +116,7 @@ SYS_REFINE = """你是字幕润色专家。拿到“英文原文 / 初译”后�
 示例：
 输入：[1] Oh fuck yes... fuck... / 噢操 对… 操…
 输出：[1] 操 好爽… 操我…"""
+
 # ============================================================
 
 class LimitExceeded(RuntimeError): pass
@@ -183,27 +191,104 @@ def keyterms_for(vp):
         if any(w in KT_BLACK for w in words): continue
         if re.fullmatch(r"\d+", words[0]): continue
         found.add(phrase)
-    kt = list(found) + [k for k in KEYTERMS_MANUAL if k not in found]
-    return kt[:40]
+    return list(found)[:40]
 
+# ---------- 小米 MiMo 转录 ----------
+def transcribe_mimo(path, offset, prompt="", language="en"):
+    """
+    调用小米 MiMo-V2.5-ASR API，支持 OpenAI 兼容格式和原生格式。
+    """
+    # 尝试 OpenAI 兼容格式（常见）
+    url1 = f"{MIMO_BASE_URL}/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {MIMO_API_KEY}"}
+    files = {"file": (os.path.basename(path), open(path, "rb"), "audio/mpeg")}
+    data = {"model": "mimo-v2.5-asr", "language": language, "response_format": "verbose_json"}
+    if prompt:
+        data["prompt"] = prompt
+
+    try:
+        r = requests.post(url1, headers=headers, files=files, data=data, timeout=600)
+        if r.status_code == 200:
+            j = r.json()
+            segments = j.get("segments", [])
+            if not segments and "text" in j:  # 简单结果
+                segments = [{"start": 0.0, "end": 10.0, "text": j["text"]}]  # 近似
+            out = []
+            for s in segments:
+                text = s.get("text", "").strip()
+                if not text: continue
+                out.append({
+                    "start": float(s.get("start", 0)) + offset,
+                    "end": float(s.get("end", 0)) + offset,
+                    "text": text
+                })
+            return out
+    except Exception as e:
+        print(f"    ⚠ 小米 OpenAI 格式失败: {e}")
+
+    # 尝试小米原生格式（根据文档推测）
+    url2 = f"{MIMO_BASE_URL}/speech/recognize"
+    files = {"audio": (os.path.basename(path), open(path, "rb"), "audio/mpeg")}
+    data2 = {"language": language, "enable_timestamp": "true", "punctuation": "true"}
+    if prompt:
+        data2["context"] = prompt  # 可能支持热词，但不保证
+
+    try:
+        r = requests.post(url2, headers=headers, files=files, data=data2, timeout=600)
+        if r.status_code == 200:
+            j = r.json()
+            # 假设返回格式为 {"result": [{"text": "...", "start": 1.2, "end": 3.4}]}
+            items = j.get("result") or j.get("sentences") or []
+            if not items:
+                # 可能直接是文本
+                text = j.get("text") or j.get("data") or ""
+                if text:
+                    items = [{"text": text, "start": 0.0, "end": 10.0}]
+            out = []
+            for it in items:
+                text = it.get("text", "").strip()
+                if not text: continue
+                out.append({
+                    "start": float(it.get("start", 0)) + offset,
+                    "end": float(it.get("end", 0)) + offset,
+                    "text": text
+                })
+            return out
+    except Exception as e:
+        print(f"    ⚠ 小米原生格式失败: {e}")
+
+    # 全部失败，抛出异常
+    raise RuntimeError("小米转录 API 调用失败，请检查 Key 和 URL 是否正确。")
+
+# ---------- Groq Whisper 备选 ----------
 def transcribe_whisper(path, offset, prompt=""):
-    data={"model":"whisper-large-v3","language":"en","response_format":"verbose_json","temperature":0.0}
-    if prompt: data["prompt"]=prompt
-    with open(path,"rb") as f:
-        r = post_retry(GROQ_ASR, headers={"Authorization":f"Bearer {GROQ}"},
-            data=data, files={"file":(os.path.basename(path),f,"audio/mpeg")}, timeout=900)
+    data = {"model": "whisper-large-v3", "language": "en", "response_format": "verbose_json", "temperature": 0.0}
+    if prompt: data["prompt"] = prompt
+    with open(path, "rb") as f:
+        r = post_retry(GROQ_ASR, headers={"Authorization": f"Bearer {GROQ_FALLBACK_KEY}"},
+            data=data, files={"file": (os.path.basename(path), f, "audio/mpeg")}, timeout=900)
     out, prev = [], None
-    for s in r.json().get("segments",[]):
-        if s.get("no_speech_prob",0) > 0.6 or s.get("avg_logprob",0) < -0.8: continue
-        t=(s.get("text") or "").strip()
-        if not t or len(t)<2: continue
-        if t==prev and len(t)>30: continue
-        prev=t; out.append({"start":float(s.get("start",0))+offset,"end":float(s.get("end",0))+offset,"text":t})
+    for s in r.json().get("segments", []):
+        if s.get("no_speech_prob", 0) > 0.6 or s.get("avg_logprob", 0) < -0.8: continue
+        t = (s.get("text") or "").strip()
+        if not t or len(t) < 2: continue
+        if t == prev and len(t) > 30: continue
+        prev = t
+        out.append({"start": float(s.get("start", 0)) + offset, "end": float(s.get("end", 0)) + offset, "text": t})
     return out
 
 def transcribe(path, offset, prompt="", kt=None):
-    # 固定使用 Whisper（Groq）
-    return transcribe_whisper(path, offset, prompt)
+    """
+    根据 ASR 配置选择转录引擎。
+    """
+    if ASR == "mimo":
+        try:
+            return transcribe_mimo(path, offset, prompt)
+        except Exception as e:
+            print(f"  ⚠ 小米转录失败，回退到 Whisper: {e}")
+            return transcribe_whisper(path, offset, prompt)
+    else:
+        return transcribe_whisper(path, offset, prompt)
 
 def dl(vp, path):
     with requests.get(wurl(vp), auth=AUTH, stream=True, timeout=3600) as r:
@@ -214,6 +299,7 @@ def dl(vp, path):
                 if total: print(f"\r    下载 {got/1e6:.0f}/{total/1e6:.0f}MB",end="")
     print()
 
+# 预下载下一个视频（后台线程）
 _pf = {}
 def start_pf(idx, vp):
     path=f"/tmp/_pf_{idx}.mp4"; evt=threading.Event(); rec={"evt":evt,"path":path,"err":None}; _pf[idx]=rec
@@ -244,7 +330,7 @@ def _chat(messages):
                 if e.response is not None and e.response.status_code == 400: continue
                 raise
         raise RuntimeError("deepseek 调用失败")
-    r = post_retry(GROQ_CHAT, headers={"Authorization":f"Bearer {GROQ}","Content-Type":"application/json"},
+    r = post_retry(GROQ_CHAT, headers={"Authorization":f"Bearer {GROQ_FALLBACK_KEY}","Content-Type":"application/json"},
         json={"model":"llama-3.3-70b-versatile","temperature":0.2,"messages":messages}, timeout=300)
     return r.json()["choices"][0]["message"]["content"]
 
@@ -258,14 +344,13 @@ def _parse_batch(txt, n):
 def tr_batch(texts, ctx=""):
     body="\n".join(f"[{i+1}] {x}" for i,x in enumerate(texts))
     user=(ctx+body) if ctx else body
-    txt=_chat([{"role":"system","content":SYS},{"role":"user","content":user}])   # 固定系统提示词
+    txt=_chat([{"role":"system","content":SYS},{"role":"user","content":user}])
     return _parse_batch(txt, len(texts))
 
 def tr_one(x):
     return _chat([{"role":"system","content":SYS1},{"role":"user","content":x}]).strip()
 
 def extract_glossary(alls):
-    # 如果 GLOSSARY 为 True，仍提取，但会降低缓存命中，建议保持 False
     if not (GLOSSARY and alls): return ""
     text=" ".join(s["text"] for s in alls)
     if len(text)>60000: text=text[:60000]
@@ -289,7 +374,7 @@ def _run_batches(segs, worker, label):
         if _stop.is_set(): return
         try: worker(start, ctx_for(start), segs[start:start+BATCH], res)
         except LimitExceeded: pass
-    job(batches[0])  # 预热第一批，让缓存写入
+    job(batches[0])  # 预热第一批
     if len(batches) > 1 and not _stop.is_set():
         with ThreadPoolExecutor(max_workers=TR_W) as ex:
             futs=[ex.submit(job,b) for b in batches[1:]]
@@ -329,85 +414,152 @@ def translate_all(segs):
         print("    润色中(REFINE)..."); res=_run_batches(segs, _do_refine, "润色")
     return res
 
+# ========== 智能字幕拆分 ==========
+def split_subtitle(text, start, end, max_len=25):
+    if not text:
+        return [(text, start, end)]
+    separators = r'[。！？，、；：\.,;!?]'
+    parts = re.split(separators, text)
+    parts = [p.strip() for p in parts if p.strip()]
+    if len(parts) <= 1:
+        parts = text.split()
+    merged = []
+    for p in parts:
+        if not merged:
+            merged.append(p)
+        else:
+            if len(merged[-1]) + len(p) + 1 <= max_len:
+                merged[-1] += " " + p
+            else:
+                merged.append(p)
+    if len(merged) == 1 and len(merged[0]) > max_len:
+        words = merged[0].split()
+        merged = []
+        cur = ""
+        for w in words:
+            if len(cur) + len(w) + 1 <= max_len:
+                cur = cur + " " + w if cur else w
+            else:
+                merged.append(cur)
+                cur = w
+        if cur:
+            merged.append(cur)
+    total = end - start
+    segs = []
+    for i, part in enumerate(merged):
+        seg_start = start + i * total / len(merged)
+        seg_end = start + (i + 1) * total / len(merged)
+        segs.append((part, seg_start, seg_end))
+    return segs
+
 def process_local(local, vp, srt_rel):
-    name=os.path.splitext(os.path.basename(vp))[0]
-    srt_local=f"/tmp/{name}.srt"; tmp=tempfile.mkdtemp()
-    kt = keyterms_for(vp) if GLOSSARY else []  # 若关闭术语表，则不用 keyterms
+    name = os.path.splitext(os.path.basename(vp))[0]
+    srt_local = f"/tmp/{name}.srt"
+    tmp = tempfile.mkdtemp()
+    kt = keyterms_for(vp) if GLOSSARY else []
     c0, p0 = _cached_in, _prompt_in
     try:
         print("  抽音频+切片...")
         subprocess.run(["ffmpeg","-y","-i",local,"-vn","-ac","1","-ar","16000","-b:a","64k",
             "-f","segment","-segment_time",str(SEG),"-c:a","libmp3lame",os.path.join(tmp,"c_%03d.mp3")],
-            check=True,capture_output=True)
-        chunks=sorted(glob.glob(os.path.join(tmp,"c_*.mp3")))
-        print(f"  共{len(chunks)}片, 转写[Whisper-large-v3 via Groq]"+(f", keyterm {len(kt)} 个" if kt else "")+"...")
-        alls=[]; last_prompt=""
-        for idx,c in enumerate(chunks):
-            if _stop.is_set(): break
+            check=True, capture_output=True)
+        chunks = sorted(glob.glob(os.path.join(tmp, "c_*.mp3")))
+        print(f"  共{len(chunks)}片, 转写[MiMo-V2.5-ASR]" + (f", keyterm {len(kt)} 个" if kt else "") + "...")
+        alls = []
+        last_prompt = ""
+        for idx, c in enumerate(chunks):
+            if _stop.is_set():
+                break
             print(f"  转写{idx+1}/{len(chunks)}...")
-            segs=transcribe(c, idx*SEG, last_prompt, kt); alls.extend(segs)
-            last_prompt=" ".join(s["text"] for s in segs[-6:])[-300:]
+            segs = transcribe(c, idx * SEG, last_prompt, kt)
+            alls.extend(segs)
+            last_prompt = " ".join(s["text"] for s in segs[-6:])[-300:]
         print(f"  转写{len(alls)}句")
-        # 提取术语表（若开启 GLOSSARY）
         g = extract_glossary(alls) if GLOSSARY else ""
-        # 动态系统提示词完全固定，不再加入额外信息，保证缓存命中
-        # 但为了术语表，若开启则仍拼接到系统提示词（会破坏缓存，不推荐）
-        # 我们保持 SYS 固定，不加入术语表，术语表只作为额外背景（但未使用）
-        # 实际上我们完全不使用术语表
         print(f"  翻译(并发{TR_W}, 预热缓存)...")
-        trs=translate_all(alls) if alls else []
-        with open(srt_local,"w",encoding="utf-8") as f:
-            for n,(s,t) in enumerate(zip(alls,trs),1):
-                f.write(f"{n}\n{fmt(s['start'])} --> {fmt(s['end'])}\n{sfx_render(t)}\n\n")
+        trs = translate_all(alls) if alls else []
+        
+        with open(srt_local, "w", encoding="utf-8") as f:
+            sub_idx = 1
+            for s, t in zip(alls, trs):
+                text = sfx_render(t)
+                sub_segs = split_subtitle(text, s['start'], s['end'], max_len=25)
+                for part_text, part_start, part_end in sub_segs:
+                    f.write(f"{sub_idx}\n{fmt(part_start)} --> {fmt(part_end)}\n{part_text}\n\n")
+                    sub_idx += 1
+        
         print("  写回123云盘...")
-        with open(srt_local,"rb") as f:
+        with open(srt_local, "rb") as f:
             requests.put(wurl(srt_rel), auth=AUTH, data=f.read(), timeout=120).raise_for_status()
     finally:
-        try: os.remove(local)
-        except: pass
+        try:
+            os.remove(local)
+        except:
+            pass
         shutil.rmtree(tmp, ignore_errors=True)
-    dc, dp = _cached_in-c0, _prompt_in-p0
-    if dp > 0: print(f"  📈 本视频缓存命中 {dc/dp:.0%}  (命中{dc}/输入{dp} token)")
+    dc, dp = _cached_in - c0, _prompt_in - p0
+    if dp > 0:
+        print(f"  📈 本视频缓存命中 {dc/dp:.0%}  (命中{dc}/输入{dp} token)")
 
-# ================= 全自动主流程 =================
-print(f"ASR={ASR}  翻译={DEEP_MODEL if ENGINE=='deepseek' else 'llama(免费)'} REFINE={REFINE} ITALIC_SFX={ITALIC_SFX} 并发={TR_W} 缓存预热=开")
-if ENGINE == "deepseek":
-    print("自检 DeepSeek(flash,关思考)...")
-    try: _chat([{"role":"user","content":"reply OK"}]); print("  自检通过\n")
-    except Exception as e: print("\n❌ 自检失败, 未处理未扣费。核对 Secrets:", e); sys.exit(1)
+# ================= 主流程 =================
+if __name__ == "__main__":
+    print(f"🚀 使用小米 MiMo-V2.5-ASR 转录 | 翻译={DEEP_MODEL} | 并发={TR_W} | 批次={BATCH}")
+    print("   (固定系统提示词 + 预热缓存 + 智能字幕拆分)")
 
-print("扫描目录树...")
-allf = walk(ROOT)
-videos = [f for f in allf if os.path.splitext(f)[1].lower() in VIDEO_EXT]
-srt_set = set(f for f in allf if f.lower().endswith(".srt"))
-todo = [vp for vp in videos if (os.path.splitext(vp)[0]+".srt") not in srt_set]
-print(f"📊 扫描到视频 {len(videos)} 个 | 已完成 {len(videos)-len(todo)} | 待处理 {len(todo)}\n")
+    if ENGINE == "deepseek":
+        print("自检 DeepSeek...")
+        try:
+            _chat([{"role":"user","content":"reply OK"}])
+            print("  自检通过\n")
+        except Exception as e:
+            print("\n❌ 自检失败, 检查 DEEPSEEK_KEY:", e)
+            sys.exit(1)
 
-done = 0
-for idx,vp in enumerate(todo):
-    if _stop.is_set(): print("\n⏸ 预算到, 停止。进度已存。"); break
-    srt_rel = os.path.splitext(vp)[0]+".srt"
-    print(f"[{idx+1}/{len(todo)}] {vp}")
-    local = take_pf(idx)
-    if local is None:
-        print("  下载(无预下载)..."); local="/tmp/_src.mp4"
-        try: dl(vp, local)
-        except Exception as e: print("  ❌ 下载失败, 跳过:", e); continue
+    print("扫描目录树...")
+    allf = walk(ROOT)
+    videos = [f for f in allf if os.path.splitext(f)[1].lower() in VIDEO_EXT]
+    srt_set = set(f for f in allf if f.lower().endswith(".srt"))
+    todo = [vp for vp in videos if (os.path.splitext(vp)[0]+".srt") not in srt_set]
+    print(f"📊 扫描到视频 {len(videos)} 个 | 已完成 {len(videos)-len(todo)} | 待处理 {len(todo)}\n")
+
+    done = 0
+    for idx, vp in enumerate(todo):
+        if _stop.is_set():
+            print("\n⏸ 预算到或手动停止。进度已存。")
+            break
+        srt_rel = os.path.splitext(vp)[0]+".srt"
+        print(f"[{idx+1}/{len(todo)}] {vp}")
+
+        local = take_pf(idx)
+        if local is None:
+            print("  下载(无预下载)...")
+            local = "/tmp/_src.mp4"
+            try:
+                dl(vp, local)
+            except Exception as e:
+                print("  ❌ 下载失败, 跳过:", e)
+                continue
+        else:
+            print("  命中预下载✓")
+        if idx+1 < len(todo):
+            start_pf(idx+1, todo[idx+1])
+
+        try:
+            process_local(local, vp, srt_rel)
+            done += 1
+            print(f"  ✅ 完成（新处理 {done}）")
+            time.sleep(2)
+        except LimitExceeded as e:
+            print("\n⏸", e, "\n→ 进度已存。")
+            break
+        except Exception as e:
+            print("  ❌ 跳过:", e)
+
+    tot_hit = _cached_in/_prompt_in if _prompt_in else 0
+    print(f"\n===== 本次新处理 {done}, 剩余 {len(todo)-done} | 全程缓存命中 {tot_hit:.0%} =====")
+    if _failed_dirs:
+        print("\n⚠ 以下目录扫描异常:")
+        for d in _failed_dirs: print("   -", d)
     else:
-        print("  命中预下载✓")
-    if idx+1 < len(todo): start_pf(idx+1, todo[idx+1])
-    try:
-        process_local(local, vp, srt_rel); done+=1; print(f"  ✅ 完成（新处理 {done}）")
-    except LimitExceeded as e:
-        print("\n⏸", e, "\n→ 进度已存。下次定时触发自动续跑。"); break
-    except Exception as e:
-        print("  ❌ 跳过:", e)
-
-tot_hit = _cached_in/_prompt_in if _prompt_in else 0
-print(f"\n===== 本次新处理 {done}, 剩余 {len(todo)-done} | 全程缓存命中 {tot_hit:.0%} =====")
-if _failed_dirs:
-    print("\n⚠ 以下目录本轮扫描异常, 下次定时触发通常补齐：")
-    for d in _failed_dirs: print("   -", d)
-else:
-    print("\n✅ 所有子目录扫描完整、无漏扫。")
-print("剩余>0: 等下一次定时触发(每8小时)自动续跑, 或手动 Run workflow 立即续跑。")
+        print("\n✅ 目录扫描完整。")
+    print("剩余>0: 再次运行续跑。")
