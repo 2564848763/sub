@@ -1,44 +1,49 @@
-name: subtitle
+name: 自动生成视频字幕
 
 on:
-  workflow_dispatch:
-    inputs:
-      root:
-        description: '临时指定目录(留空=用Secrets里的ROOT)'
-        default: ''
+  workflow_dispatch:          # 允许手动触发
   schedule:
-    - cron: '0 */8 * * *'
-
-concurrency:
-  group: subtitle
-  cancel-in-progress: false
+    - cron: '0 2 * * *'       # 每天凌晨 2:00 自动运行
 
 jobs:
-  run:
+  generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 360      # 6小时，可根据需要调整
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装系统依赖（ffmpeg）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - name: install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-      - run: pip install -q requests
-      - name: run subtitle
+          python-version: '3.10'
+
+      - name: 安装 Python 依赖
+        run: |
+          pip install --upgrade pip
+          pip install requests
+
+      - name: 运行字幕生成脚本
         env:
+          # 必填（请确保 Secrets 名称与以下完全一致）
           WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
           WEBDAV_PASS: ${{ secrets.WEBDAV_PASS }}
-          GROQ_KEY: ${{ secrets.GROQ_KEY }}
           DEEPSEEK_KEY: ${{ secrets.DEEPSEEK_KEY }}
-          DEEPGRAM_KEY: ${{ secrets.DEEPGRAM_KEY }}
-          ASR: ${{ secrets.ASR }}
-          KEYTERMS: ${{ secrets.KEYTERMS }}
-          ITALIC_SFX: ${{ secrets.ITALIC_SFX }}
-          CTX_VIEW: ${{ secrets.CTX_VIEW }}
-          CTX_MAP: ${{ secrets.CTX_MAP }}
-          ROOT: ${{ github.event.inputs.root || secrets.ROOT }}
-          ENGINE: deepseek
+          MIMO_API_KEY: ${{ secrets.MIMO_API_KEY }}
+          # 可选（若不设置则使用脚本默认值）
+          ROOT: ${{ secrets.ROOT || '视频/蔡斯' }}
+          ASR: ${{ secrets.ASR || 'mimo' }}
+          GROQ_KEY: ${{ secrets.GROQ_KEY }}   # 回退用，可不填
+          BUDGET: ${{ secrets.BUDGET || '9.8' }}
+          GLOSSARY: 'false'
           REFINE: 'false'
-          BUDGET: '9.8'
-        run: python sub.py
+          TR_W: '4'
+          BATCH: '25'
+        run: |
+          python sub.py
