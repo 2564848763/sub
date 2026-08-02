@@ -307,7 +307,7 @@ def take_pf(idx):
 def _chat(messages):
     if _stop.is_set(): raise LimitExceeded("已超预算, 停止")
     
-    # MiMo-V2.5-Pro 默认开启 thinking 模式[reference:8]，关闭以获取直接回复
+    # MiMo-V2.5-Pro 默认开启 thinking 模式，关闭以获取直接回复
     body = {
         "model": MIMO_MODEL,
         "messages": messages,
@@ -345,15 +345,16 @@ def _parse_batch(txt, n):
     return [res.get(i+1) for i in range(n)]
 
 def tr_batch(texts, ctx=""):
-    body="\n".join(f"[{i+1}] {x}" for i,x in enumerate(texts))
+    # 修复：提取字典中的 'text' 字段进行翻译，防止整块 dict 传给大模型
+    body="\n".join(f"[{i+1}] {x['text'] if isinstance(x, dict) else x}" for i,x in enumerate(texts))
     user=(ctx+body) if ctx else body
-    # 已将 SYS 拼接到 user role，避免部分模型不支持 system role 导致的 400 错误
     txt=_chat([{"role":"user","content": SYS + "\n\n" + user}])
     return _parse_batch(txt, len(texts))
 
 def tr_one(x):
-    # 已将 SYS1 拼接到 user role
-    return _chat([{"role":"user","content": SYS1 + "\n\n" + x}]).strip()
+    # 修复：确保传入给字符串拼接的是纯文本，防止与字典直接相加报错
+    raw_text = x['text'] if isinstance(x, dict) else str(x)
+    return _chat([{"role":"user","content": SYS1 + "\n\n" + raw_text}]).strip()
 
 def extract_glossary(alls):
     if not (GLOSSARY and alls): return ""
@@ -397,11 +398,13 @@ def _do_translate(start, ctx, texts, res):
     except Exception as e: print("    批量失败,全逐行:",e)
     if part is None: part=[None]*len(texts)
     for j,t in enumerate(texts):
-        if _stop.is_set(): part[j]=part[j] or t; continue
+        # 提取备用的纯文本原文
+        fallback_text = t['text'] if isinstance(t, dict) else str(t)
+        if _stop.is_set(): part[j]=part[j] or fallback_text; continue
         if part[j] is None:
             try: part[j]=tr_one(t)
             except LimitExceeded: raise
-            except Exception as e: print("    单行失败:",e); part[j]=t
+            except Exception as e: print("    单行失败:",e); part[j]=fallback_text
     for j,t in enumerate(part): res[start+j]=t
 
 def _do_refine(start, ctx, segs_block, res):
