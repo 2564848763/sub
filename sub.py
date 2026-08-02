@@ -13,7 +13,7 @@ WEBDAV_BASE = _get_env("WEBDAV_BASE", required=False, default="https://webdav.12
 WEBDAV_USER = _get_env("WEBDAV_USER", required=True)
 WEBDAV_PASS = _get_env("WEBDAV_PASS", required=True)
 
-# ---- 小米 MiMo API 配置（官方 Base URL 含 /v1） ----
+# ---- 翻译引擎：小米 MiMo-V2.5-Pro ----
 MIMO_API_KEY = _get_env("MIMO_API_KEY", required=True)
 MIMO_BASE_URL = _get_env("MIMO_BASE_URL", required=False, default="https://api.xiaomimimo.com/v1")
 MIMO_MODEL = _get_env("MIMO_MODEL", required=False, default="mimo-v2.5-pro")
@@ -35,6 +35,7 @@ if not shutil.which("ffmpeg"):
 
 AUTH = (WEBDAV_USER, WEBDAV_PASS)
 GROQ_ASR  = "https://api.groq.com/openai/v1/audio/transcriptions"
+MIMO_CHAT = f"{MIMO_BASE_URL}/chat/completions"
 VIDEO_EXT = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.webm','.m4v','.ts','.mpg','.mpeg'}
 SEG = 600
 COST = 0.0
@@ -145,7 +146,8 @@ def post_retry(url, **kw):
     raise LimitExceeded("多次重试仍失败")
 
 def walk(rel):
-    out, norm = [], rel.strip("/")
+    out, norm = rel.strip("/"), rel.strip("/")
+    out = []
     r = None
     for attempt in range(3):
         try:
@@ -193,8 +195,7 @@ def keyterms_for(vp):
 
 # ---------- 小米 MiMo 转录 (ASR) ----------
 def transcribe_mimo(path, offset, prompt="", language="en"):
-    # 使用正确的端点：/v1/audio/transcriptions
-    url = f"{MIMO_BASE_URL}/audio/transcriptions"
+    url1 = f"{MIMO_BASE_URL}/audio/transcriptions"
     headers = {"Authorization": f"Bearer {MIMO_API_KEY}"}
     files = {"file": (os.path.basename(path), open(path, "rb"), "audio/mpeg")}
     data = {"model": "mimo-v2.5-asr", "language": language, "response_format": "verbose_json"}
@@ -202,7 +203,7 @@ def transcribe_mimo(path, offset, prompt="", language="en"):
         data["prompt"] = prompt
 
     try:
-        r = requests.post(url, headers=headers, files=files, data=data, timeout=600)
+        r = requests.post(url1, headers=headers, files=files, data=data, timeout=600)
         if r.status_code == 200:
             j = r.json()
             segments = j.get("segments", [])
@@ -219,14 +220,16 @@ def transcribe_mimo(path, offset, prompt="", language="en"):
                 })
             return out
     except Exception as e:
-        print(f"    ⚠ 小米 ASR 失败: {e}")
+        print(f"    ⚠ 小米 ASR OpenAI 格式失败: {e}")
 
-    # 尝试原生格式（备选）
     url2 = f"{MIMO_BASE_URL}/speech/recognize"
-    files2 = {"audio": (os.path.basename(path), open(path, "rb"), "audio/mpeg")}
+    files = {"audio": (os.path.basename(path), open(path, "rb"), "audio/mpeg")}
     data2 = {"language": language, "enable_timestamp": "true", "punctuation": "true"}
+    if prompt:
+        data2["context"] = prompt
+
     try:
-        r = requests.post(url2, headers=headers, files=files2, data=data2, timeout=600)
+        r = requests.post(url2, headers=headers, files=files, data=data2, timeout=600)
         if r.status_code == 200:
             j = r.json()
             items = j.get("result") or j.get("sentences") or []
@@ -247,7 +250,7 @@ def transcribe_mimo(path, offset, prompt="", language="en"):
     except Exception as e:
         print(f"    ⚠ 小米 ASR 原生格式失败: {e}")
 
-    raise RuntimeError("小米 ASR 调用失败")
+    raise RuntimeError("小米 ASR API 调用失败，请检查 Key 和 URL 是否正确。")
 
 # ---------- Groq Whisper 备选 ----------
 def transcribe_whisper(path, offset, prompt=""):
@@ -300,26 +303,20 @@ def take_pf(idx):
     rec["evt"].wait()
     return None if rec["err"] else rec["path"]
 
-# ===== 【官方修正】聊天 API =====
+# ===== 【核心改动】翻译引擎：小米 MiMo-V2.5-Pro =====
 def _chat(messages):
     if _stop.is_set(): raise LimitExceeded("已超预算, 停止")
     
-    # 官方 Base URL 已包含 /v1，这里直接拼接 /chat/completions
-    url = f"{MIMO_BASE_URL}/chat/completions"
+    # MiMo-V2.5-Pro 默认开启 thinking 模式[reference:8]，关闭以获取直接回复
     body = {
         "model": MIMO_MODEL,
         "messages": messages,
-        "max_completion_tokens": 4096,          # 官方推荐使用 max_completion_tokens
-        "temperature": 0.2,                     # 精确翻译，低温
-        "top_p": 0.95,
-        "stream": False,
-        "stop": None,
-        "frequency_penalty": 0,
-        "presence_penalty": 0
+        # 已移除 temperature 参数，防止 400 报错
+        "enable_thinking": False
     }
     
     try:
-        r = post_retry(url, 
+        r = post_retry(MIMO_CHAT, 
                        headers={"Authorization": f"Bearer {MIMO_API_KEY}", "Content-Type": "application/json"},
                        json=body, timeout=300)
         u = r.json().get("usage", {})
@@ -327,7 +324,16 @@ def _chat(messages):
             raise LimitExceeded(f"已达¥{COST:.2f}, 自动停")
         return r.json()["choices"][0]["message"]["content"]
     except requests.exceptions.HTTPError as e:
-        # 若因参数不兼容失败，尝试去掉不支持的参数（但官方示例都有，应该不会）
+        if e.response is not None and e.response.status_code == 400:
+            # 如果 enable_thinking 不被支持，尝试不带该参数
+            body.pop("enable_thinking", None)
+            r = post_retry(MIMO_CHAT, 
+                           headers={"Authorization": f"Bearer {MIMO_API_KEY}", "Content-Type": "application/json"},
+                           json=body, timeout=300)
+            u = r.json().get("usage", {})
+            if add_cost(u):
+                raise LimitExceeded(f"已达¥{COST:.2f}, 自动停")
+            return r.json()["choices"][0]["message"]["content"]
         raise
 # ============================================================
 
@@ -341,19 +347,22 @@ def _parse_batch(txt, n):
 def tr_batch(texts, ctx=""):
     body="\n".join(f"[{i+1}] {x}" for i,x in enumerate(texts))
     user=(ctx+body) if ctx else body
-    txt=_chat([{"role":"system","content":SYS},{"role":"user","content":user}])
+    # 已将 SYS 拼接到 user role，避免部分模型不支持 system role 导致的 400 错误
+    txt=_chat([{"role":"user","content": SYS + "\n\n" + user}])
     return _parse_batch(txt, len(texts))
 
 def tr_one(x):
-    return _chat([{"role":"system","content":SYS1},{"role":"user","content":x}]).strip()
+    # 已将 SYS1 拼接到 user role
+    return _chat([{"role":"user","content": SYS1 + "\n\n" + x}]).strip()
 
 def extract_glossary(alls):
     if not (GLOSSARY and alls): return ""
     text=" ".join(s["text"] for s in alls)
     if len(text)>60000: text=text[:60000]
     try:
-        out=_chat([{"role":"system","content":"你是术语提取器。只输出名词表，不翻译整段，无额外文字。"},
-                   {"role":"user","content":"从以下英文字幕提取人名/专有名词/反复出现的称呼与术语，给统一简体中文译法，每行 英文=中文，按出现顺序去重，无则只输出 NONE：\n"+text}])
+        # 已合并为单个 user role
+        prompt = "你是术语提取器。只输出名词表，不翻译整段，无额外文字。\n\n" + "从以下英文字幕提取人名/专有名词/反复出现的称呼与术语，给统一简体中文译法，每行 英文=中文，按出现顺序去重，无则只输出 NONE：\n" + text
+        out=_chat([{"role":"user","content": prompt}])
     except Exception as e:
         print("  glossary提取失败,降级空表:",e); return ""
     lines=[ln.strip() for ln in out.splitlines() if "=" in ln and ln.strip().upper()!="NONE"]
@@ -399,7 +408,8 @@ def _do_refine(start, ctx, segs_block, res):
     init=res[start:start+len(segs_block)]
     body="\n".join(f"[{i+1}] {segs_block[i]['text']} / {init[i]}" for i in range(len(segs_block)))
     try:
-        pr=_parse_batch(_chat([{"role":"system","content":SYS_REFINE},{"role":"user","content":body}]), len(segs_block))
+        # 已合并为单个 user role
+        pr=_parse_batch(_chat([{"role":"user","content": SYS_REFINE + "\n\n" + body}]), len(segs_block))
         for j,t in enumerate(pr):
             if t: res[start+j]=t
     except LimitExceeded: raise
@@ -501,7 +511,6 @@ def process_local(local, vp, srt_rel):
 # ================= 主流程 =================
 if __name__ == "__main__":
     print(f"🚀 使用小米 MiMo-V2.5-ASR 转录 + MiMo-V2.5-Pro 翻译 | 并发={TR_W} | 批次={BATCH}")
-    print(f"   Base URL: {MIMO_BASE_URL} | 模型: {MIMO_MODEL}")
     print("   (固定系统提示词 + 预热缓存 + 智能字幕拆分)")
 
     print("自检 MiMo-V2.5-Pro...")
@@ -509,7 +518,7 @@ if __name__ == "__main__":
         _chat([{"role":"user","content":"reply OK"}])
         print("  自检通过\n")
     except Exception as e:
-        print("\n❌ 自检失败, 检查 MIMO_API_KEY 或网络:", e)
+        print("\n❌ 自检失败, 检查 MIMO_API_KEY:", e)
         sys.exit(1)
 
     print("扫描目录树...")
