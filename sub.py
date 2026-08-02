@@ -12,10 +12,13 @@ def _get_env(var, required=True, default=None):
 WEBDAV_BASE = _get_env("WEBDAV_BASE", required=False, default="https://webdav.123pan.cn/webdav").rstrip("/")
 WEBDAV_USER = _get_env("WEBDAV_USER", required=True)
 WEBDAV_PASS = _get_env("WEBDAV_PASS", required=True)
-DEEP        = _get_env("DEEPSEEK_KEY", required=True)
+
+# ---- 翻译引擎：小米 MiMo-V2.5-Pro ----
+MIMO_API_KEY = _get_env("MIMO_API_KEY", required=True)
+MIMO_BASE_URL = _get_env("MIMO_BASE_URL", required=False, default="https://api.xiaomimimo.com/v1")
+MIMO_MODEL = _get_env("MIMO_MODEL", required=False, default="mimo-v2.5-pro")
+
 ROOT        = _get_env("ROOT", required=False, default="视频/蔡斯")
-ENGINE      = _get_env("ENGINE", required=False, default="deepseek")
-DEEP_MODEL  = _get_env("DEEP_MODEL", required=False, default="deepseek-v4-flash")
 ASR         = _get_env("ASR", required=False, default="mimo")
 REFINE      = _get_env("REFINE", required=False, default="false").lower() == "true"
 BUDGET      = float(_get_env("BUDGET", required=False, default="9.8"))
@@ -24,10 +27,7 @@ TR_W, BATCH = 4, 25
 GLOSSARY    = _get_env("GLOSSARY", required=False, default="false").lower() == "true"
 ITALIC_SFX  = _get_env("ITALIC_SFX", required=False, default="false").lower() == "true"
 
-MIMO_API_KEY = _get_env("MIMO_API_KEY", required=True)
-MIMO_BASE_URL = _get_env("MIMO_BASE_URL", required=False, default="https://api.mimo.mi.com/v1")
-
-GROQ_FALLBACK_KEY = os.environ.get("GROQ_KEY", "")   # 可选回退
+GROQ_FALLBACK_KEY = os.environ.get("GROQ_KEY", "")
 
 # 自动安装 ffmpeg
 if not shutil.which("ffmpeg"):
@@ -35,8 +35,7 @@ if not shutil.which("ffmpeg"):
 
 AUTH = (WEBDAV_USER, WEBDAV_PASS)
 GROQ_ASR  = "https://api.groq.com/openai/v1/audio/transcriptions"
-GROQ_CHAT = "https://api.groq.com/openai/v1/chat/completions"
-DEEP_CHAT = "https://api.deepseek.com/chat/completions"
+MIMO_CHAT = f"{MIMO_BASE_URL}/chat/completions"
 VIDEO_EXT = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.webm','.m4v','.ts','.mpg','.mpeg'}
 SEG = 600
 COST = 0.0
@@ -193,12 +192,8 @@ def keyterms_for(vp):
         found.add(phrase)
     return list(found)[:40]
 
-# ---------- 小米 MiMo 转录 ----------
+# ---------- 小米 MiMo 转录 (ASR) ----------
 def transcribe_mimo(path, offset, prompt="", language="en"):
-    """
-    调用小米 MiMo-V2.5-ASR API，支持 OpenAI 兼容格式和原生格式。
-    """
-    # 尝试 OpenAI 兼容格式（常见）
     url1 = f"{MIMO_BASE_URL}/audio/transcriptions"
     headers = {"Authorization": f"Bearer {MIMO_API_KEY}"}
     files = {"file": (os.path.basename(path), open(path, "rb"), "audio/mpeg")}
@@ -211,8 +206,8 @@ def transcribe_mimo(path, offset, prompt="", language="en"):
         if r.status_code == 200:
             j = r.json()
             segments = j.get("segments", [])
-            if not segments and "text" in j:  # 简单结果
-                segments = [{"start": 0.0, "end": 10.0, "text": j["text"]}]  # 近似
+            if not segments and "text" in j:
+                segments = [{"start": 0.0, "end": 10.0, "text": j["text"]}]
             out = []
             for s in segments:
                 text = s.get("text", "").strip()
@@ -224,23 +219,20 @@ def transcribe_mimo(path, offset, prompt="", language="en"):
                 })
             return out
     except Exception as e:
-        print(f"    ⚠ 小米 OpenAI 格式失败: {e}")
+        print(f"    ⚠ 小米 ASR OpenAI 格式失败: {e}")
 
-    # 尝试小米原生格式（根据文档推测）
     url2 = f"{MIMO_BASE_URL}/speech/recognize"
     files = {"audio": (os.path.basename(path), open(path, "rb"), "audio/mpeg")}
     data2 = {"language": language, "enable_timestamp": "true", "punctuation": "true"}
     if prompt:
-        data2["context"] = prompt  # 可能支持热词，但不保证
+        data2["context"] = prompt
 
     try:
         r = requests.post(url2, headers=headers, files=files, data=data2, timeout=600)
         if r.status_code == 200:
             j = r.json()
-            # 假设返回格式为 {"result": [{"text": "...", "start": 1.2, "end": 3.4}]}
             items = j.get("result") or j.get("sentences") or []
             if not items:
-                # 可能直接是文本
                 text = j.get("text") or j.get("data") or ""
                 if text:
                     items = [{"text": text, "start": 0.0, "end": 10.0}]
@@ -255,10 +247,9 @@ def transcribe_mimo(path, offset, prompt="", language="en"):
                 })
             return out
     except Exception as e:
-        print(f"    ⚠ 小米原生格式失败: {e}")
+        print(f"    ⚠ 小米 ASR 原生格式失败: {e}")
 
-    # 全部失败，抛出异常
-    raise RuntimeError("小米转录 API 调用失败，请检查 Key 和 URL 是否正确。")
+    raise RuntimeError("小米 ASR API 调用失败，请检查 Key 和 URL 是否正确。")
 
 # ---------- Groq Whisper 备选 ----------
 def transcribe_whisper(path, offset, prompt=""):
@@ -278,14 +269,11 @@ def transcribe_whisper(path, offset, prompt=""):
     return out
 
 def transcribe(path, offset, prompt="", kt=None):
-    """
-    根据 ASR 配置选择转录引擎。
-    """
     if ASR == "mimo":
         try:
             return transcribe_mimo(path, offset, prompt)
         except Exception as e:
-            print(f"  ⚠ 小米转录失败，回退到 Whisper: {e}")
+            print(f"  ⚠ 小米 ASR 失败，回退到 Whisper: {e}")
             return transcribe_whisper(path, offset, prompt)
     else:
         return transcribe_whisper(path, offset, prompt)
@@ -314,25 +302,39 @@ def take_pf(idx):
     rec["evt"].wait()
     return None if rec["err"] else rec["path"]
 
+# ===== 【核心改动】翻译引擎：小米 MiMo-V2.5-Pro =====
 def _chat(messages):
     if _stop.is_set(): raise LimitExceeded("已超预算, 停止")
-    if ENGINE == "deepseek":
-        for extra in [{"thinking":{"type":"disabled"},"temperature":0.2}, {"temperature":0.2}, {}]:
-            body = {"model": DEEP_MODEL, "messages": messages}; body.update(extra)
-            try:
-                r = post_retry(DEEP_CHAT, headers={"Authorization":f"Bearer {DEEP}","Content-Type":"application/json"}, json=body, timeout=300)
-                u = r.json().get("usage", {})
-                if (u.get("completion_tokens_details") or {}).get("reasoning_tokens",0):
-                    print("    ⚠ 含思考token, 成本或略高于估计")
-                if add_cost(u): raise LimitExceeded(f"已达¥{COST:.2f}, 自动停")
-                return r.json()["choices"][0]["message"]["content"]
-            except requests.exceptions.HTTPError as e:
-                if e.response is not None and e.response.status_code == 400: continue
-                raise
-        raise RuntimeError("deepseek 调用失败")
-    r = post_retry(GROQ_CHAT, headers={"Authorization":f"Bearer {GROQ_FALLBACK_KEY}","Content-Type":"application/json"},
-        json={"model":"llama-3.3-70b-versatile","temperature":0.2,"messages":messages}, timeout=300)
-    return r.json()["choices"][0]["message"]["content"]
+    
+    # MiMo-V2.5-Pro 默认开启 thinking 模式[reference:8]，关闭以获取直接回复
+    body = {
+        "model": MIMO_MODEL,
+        "messages": messages,
+        "temperature": 0.2,
+        "enable_thinking": False
+    }
+    
+    try:
+        r = post_retry(MIMO_CHAT, 
+                       headers={"Authorization": f"Bearer {MIMO_API_KEY}", "Content-Type": "application/json"},
+                       json=body, timeout=300)
+        u = r.json().get("usage", {})
+        if add_cost(u):
+            raise LimitExceeded(f"已达¥{COST:.2f}, 自动停")
+        return r.json()["choices"][0]["message"]["content"]
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 400:
+            # 如果 enable_thinking 不被支持，尝试不带该参数
+            body.pop("enable_thinking", None)
+            r = post_retry(MIMO_CHAT, 
+                           headers={"Authorization": f"Bearer {MIMO_API_KEY}", "Content-Type": "application/json"},
+                           json=body, timeout=300)
+            u = r.json().get("usage", {})
+            if add_cost(u):
+                raise LimitExceeded(f"已达¥{COST:.2f}, 自动停")
+            return r.json()["choices"][0]["message"]["content"]
+        raise
+# ============================================================
 
 def _parse_batch(txt, n):
     res={}
@@ -374,14 +376,14 @@ def _run_batches(segs, worker, label):
         if _stop.is_set(): return
         try: worker(start, ctx_for(start), segs[start:start+BATCH], res)
         except LimitExceeded: pass
-    job(batches[0])  # 预热第一批
+    job(batches[0])
     if len(batches) > 1 and not _stop.is_set():
         with ThreadPoolExecutor(max_workers=TR_W) as ex:
             futs=[ex.submit(job,b) for b in batches[1:]]
             for f in futs:
                 try: f.result()
                 except LimitExceeded: pass
-    print(f"    {label} {sum(1 for x in res if x)}/{n}  累计{'¥%.2f'%COST if ENGINE=='deepseek' else '免费'}")
+    print(f"    {label} {sum(1 for x in res if x)}/{n}  累计¥{COST:.2f}")
     return res
 
 def _do_translate(start, ctx, texts, res):
@@ -476,7 +478,7 @@ def process_local(local, vp, srt_rel):
             last_prompt = " ".join(s["text"] for s in segs[-6:])[-300:]
         print(f"  转写{len(alls)}句")
         g = extract_glossary(alls) if GLOSSARY else ""
-        print(f"  翻译(并发{TR_W}, 预热缓存)...")
+        print(f"  翻译(并发{TR_W}, 预热缓存, 模型={MIMO_MODEL})...")
         trs = translate_all(alls) if alls else []
         
         with open(srt_local, "w", encoding="utf-8") as f:
@@ -503,17 +505,16 @@ def process_local(local, vp, srt_rel):
 
 # ================= 主流程 =================
 if __name__ == "__main__":
-    print(f"🚀 使用小米 MiMo-V2.5-ASR 转录 | 翻译={DEEP_MODEL} | 并发={TR_W} | 批次={BATCH}")
+    print(f"🚀 使用小米 MiMo-V2.5-ASR 转录 + MiMo-V2.5-Pro 翻译 | 并发={TR_W} | 批次={BATCH}")
     print("   (固定系统提示词 + 预热缓存 + 智能字幕拆分)")
 
-    if ENGINE == "deepseek":
-        print("自检 DeepSeek...")
-        try:
-            _chat([{"role":"user","content":"reply OK"}])
-            print("  自检通过\n")
-        except Exception as e:
-            print("\n❌ 自检失败, 检查 DEEPSEEK_KEY:", e)
-            sys.exit(1)
+    print("自检 MiMo-V2.5-Pro...")
+    try:
+        _chat([{"role":"user","content":"reply OK"}])
+        print("  自检通过\n")
+    except Exception as e:
+        print("\n❌ 自检失败, 检查 MIMO_API_KEY:", e)
+        sys.exit(1)
 
     print("扫描目录树...")
     allf = walk(ROOT)
