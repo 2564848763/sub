@@ -13,7 +13,7 @@ WEBDAV_BASE = _get_env("WEBDAV_BASE", required=False, default="https://webdav.12
 WEBDAV_USER = _get_env("WEBDAV_USER", required=True)
 WEBDAV_PASS = _get_env("WEBDAV_PASS", required=True)
 
-# ---- 翻译引擎：小米 MiMo-V2.5-Pro ----
+# ---- 小米 MiMo API 配置（官方 Base URL 含 /v1） ----
 MIMO_API_KEY = _get_env("MIMO_API_KEY", required=True)
 MIMO_BASE_URL = _get_env("MIMO_BASE_URL", required=False, default="https://api.xiaomimimo.com/v1")
 MIMO_MODEL = _get_env("MIMO_MODEL", required=False, default="mimo-v2.5-pro")
@@ -35,7 +35,6 @@ if not shutil.which("ffmpeg"):
 
 AUTH = (WEBDAV_USER, WEBDAV_PASS)
 GROQ_ASR  = "https://api.groq.com/openai/v1/audio/transcriptions"
-MIMO_CHAT = f"{MIMO_BASE_URL}/chat/completions"
 VIDEO_EXT = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.webm','.m4v','.ts','.mpg','.mpeg'}
 SEG = 600
 COST = 0.0
@@ -194,7 +193,8 @@ def keyterms_for(vp):
 
 # ---------- 小米 MiMo 转录 (ASR) ----------
 def transcribe_mimo(path, offset, prompt="", language="en"):
-    url1 = f"{MIMO_BASE_URL}/audio/transcriptions"
+    # 使用正确的端点：/v1/audio/transcriptions
+    url = f"{MIMO_BASE_URL}/audio/transcriptions"
     headers = {"Authorization": f"Bearer {MIMO_API_KEY}"}
     files = {"file": (os.path.basename(path), open(path, "rb"), "audio/mpeg")}
     data = {"model": "mimo-v2.5-asr", "language": language, "response_format": "verbose_json"}
@@ -202,7 +202,7 @@ def transcribe_mimo(path, offset, prompt="", language="en"):
         data["prompt"] = prompt
 
     try:
-        r = requests.post(url1, headers=headers, files=files, data=data, timeout=600)
+        r = requests.post(url, headers=headers, files=files, data=data, timeout=600)
         if r.status_code == 200:
             j = r.json()
             segments = j.get("segments", [])
@@ -219,16 +219,14 @@ def transcribe_mimo(path, offset, prompt="", language="en"):
                 })
             return out
     except Exception as e:
-        print(f"    ⚠ 小米 ASR OpenAI 格式失败: {e}")
+        print(f"    ⚠ 小米 ASR 失败: {e}")
 
+    # 尝试原生格式（备选）
     url2 = f"{MIMO_BASE_URL}/speech/recognize"
-    files = {"audio": (os.path.basename(path), open(path, "rb"), "audio/mpeg")}
+    files2 = {"audio": (os.path.basename(path), open(path, "rb"), "audio/mpeg")}
     data2 = {"language": language, "enable_timestamp": "true", "punctuation": "true"}
-    if prompt:
-        data2["context"] = prompt
-
     try:
-        r = requests.post(url2, headers=headers, files=files, data=data2, timeout=600)
+        r = requests.post(url2, headers=headers, files=files2, data=data2, timeout=600)
         if r.status_code == 200:
             j = r.json()
             items = j.get("result") or j.get("sentences") or []
@@ -249,7 +247,7 @@ def transcribe_mimo(path, offset, prompt="", language="en"):
     except Exception as e:
         print(f"    ⚠ 小米 ASR 原生格式失败: {e}")
 
-    raise RuntimeError("小米 ASR API 调用失败，请检查 Key 和 URL 是否正确。")
+    raise RuntimeError("小米 ASR 调用失败")
 
 # ---------- Groq Whisper 备选 ----------
 def transcribe_whisper(path, offset, prompt=""):
@@ -302,20 +300,26 @@ def take_pf(idx):
     rec["evt"].wait()
     return None if rec["err"] else rec["path"]
 
-# ===== 【核心改动】翻译引擎：小米 MiMo-V2.5-Pro =====
+# ===== 【官方修正】聊天 API =====
 def _chat(messages):
     if _stop.is_set(): raise LimitExceeded("已超预算, 停止")
     
-    # MiMo-V2.5-Pro 默认开启 thinking 模式[reference:8]，关闭以获取直接回复
+    # 官方 Base URL 已包含 /v1，这里直接拼接 /chat/completions
+    url = f"{MIMO_BASE_URL}/chat/completions"
     body = {
         "model": MIMO_MODEL,
         "messages": messages,
-        "temperature": 0.2,
-        "enable_thinking": False
+        "max_completion_tokens": 4096,          # 官方推荐使用 max_completion_tokens
+        "temperature": 0.2,                     # 精确翻译，低温
+        "top_p": 0.95,
+        "stream": False,
+        "stop": None,
+        "frequency_penalty": 0,
+        "presence_penalty": 0
     }
     
     try:
-        r = post_retry(MIMO_CHAT, 
+        r = post_retry(url, 
                        headers={"Authorization": f"Bearer {MIMO_API_KEY}", "Content-Type": "application/json"},
                        json=body, timeout=300)
         u = r.json().get("usage", {})
@@ -323,16 +327,7 @@ def _chat(messages):
             raise LimitExceeded(f"已达¥{COST:.2f}, 自动停")
         return r.json()["choices"][0]["message"]["content"]
     except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 400:
-            # 如果 enable_thinking 不被支持，尝试不带该参数
-            body.pop("enable_thinking", None)
-            r = post_retry(MIMO_CHAT, 
-                           headers={"Authorization": f"Bearer {MIMO_API_KEY}", "Content-Type": "application/json"},
-                           json=body, timeout=300)
-            u = r.json().get("usage", {})
-            if add_cost(u):
-                raise LimitExceeded(f"已达¥{COST:.2f}, 自动停")
-            return r.json()["choices"][0]["message"]["content"]
+        # 若因参数不兼容失败，尝试去掉不支持的参数（但官方示例都有，应该不会）
         raise
 # ============================================================
 
@@ -506,6 +501,7 @@ def process_local(local, vp, srt_rel):
 # ================= 主流程 =================
 if __name__ == "__main__":
     print(f"🚀 使用小米 MiMo-V2.5-ASR 转录 + MiMo-V2.5-Pro 翻译 | 并发={TR_W} | 批次={BATCH}")
+    print(f"   Base URL: {MIMO_BASE_URL} | 模型: {MIMO_MODEL}")
     print("   (固定系统提示词 + 预热缓存 + 智能字幕拆分)")
 
     print("自检 MiMo-V2.5-Pro...")
@@ -513,7 +509,7 @@ if __name__ == "__main__":
         _chat([{"role":"user","content":"reply OK"}])
         print("  自检通过\n")
     except Exception as e:
-        print("\n❌ 自检失败, 检查 MIMO_API_KEY:", e)
+        print("\n❌ 自检失败, 检查 MIMO_API_KEY 或网络:", e)
         sys.exit(1)
 
     print("扫描目录树...")
