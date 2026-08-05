@@ -309,9 +309,13 @@ def start_pf(idx, vp):
         except Exception as e: rec["err"]=e
         finally: evt.set()
     threading.Thread(target=_t, daemon=True).start()
+
 def take_pf(idx):
-    rec=_pf.pop(idx, None); if not rec: return None
-    rec["evt"].wait(); return None if rec["err"] else rec["path"]
+    rec = _pf.pop(idx, None)
+    if not rec:
+        return None
+    rec["evt"].wait()
+    return None if rec["err"] else rec["path"]
 
 def _cleanup_zombie_files():
     for f in glob.glob(os.path.join(tempfile.gettempdir(), "_pf_*.mp4")):
@@ -522,7 +526,7 @@ def process_local(local, vp, srt_rel):
         shutil.rmtree(tmp, ignore_errors=True)
 
 if __name__ == "__main__":
-    print(f"🚀 物理极限完全体(修复语法错误+Whisper并行转写+4分钟大块吞吐+Mimo极致本土化) | ASR={ASR} | 深度思考={THINKING}")
+    print(f"🚀 物理极限完全体(修复所有语法错误+Whisper并行转写+4分钟大块吞吐+Mimo极致本土化) | ASR={ASR} | 深度思考={THINKING}")
     try: _chat([{"role":"user","content":"reply OK"}])
     except Exception as e: print("❌ API失败:", e); sys.exit(1)
 
