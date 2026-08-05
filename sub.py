@@ -1,4 +1,4 @@
-Import os, re, sys, glob, shutil, subprocess, tempfile, time, threading, html, base64, requests
+import os, re, sys, glob, shutil, subprocess, tempfile, time, threading, html, base64, requests
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, unquote, urlparse
 
