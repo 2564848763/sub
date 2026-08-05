@@ -1,49 +1,36 @@
-name: 自动生成视频字幕
-
+name: subtitle
 on:
-  workflow_dispatch:          # 允许手动触发
+  workflow_dispatch:
   schedule:
-    - cron: '0 2 * * *'       # 每天凌晨 2:00 自动运行
-
+    - cron: '0 */8 * * *'
+concurrency:
+  group: subtitle
+  cancel-in-progress: false
 jobs:
-  generate:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 360      # 6小时，可根据需要调整
-
+    timeout-minutes: 350
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 安装系统依赖（ffmpeg）
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-
-      - name: 设置 Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-
-      - name: 安装 Python 依赖
+          python-version: '3.11'
+      - name: install deps
+        run: pip install -q requests
+      - name: enable BBR
         run: |
-          pip install --upgrade pip
-          pip install requests
-
-      - name: 运行字幕生成脚本
+          sudo modprobe tcp_bbr || true
+          sudo sysctl -w net.core.default_qdisc=fq || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
+          sysctl net.ipv4.tcp_congestion_control || true
+      - name: run subtitle
         env:
-          # 必填（请确保 Secrets 名称与以下完全一致）
           WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
           WEBDAV_PASS: ${{ secrets.WEBDAV_PASS }}
-          DEEPSEEK_KEY: ${{ secrets.DEEPSEEK_KEY }}
           MIMO_API_KEY: ${{ secrets.MIMO_API_KEY }}
-          # 可选（若不设置则使用脚本默认值）
-          ROOT: ${{ secrets.ROOT || '视频/蔡斯' }}
-          ASR: ${{ secrets.ASR || 'mimo' }}
-          GROQ_KEY: ${{ secrets.GROQ_KEY }}   # 回退用，可不填
-          BUDGET: ${{ secrets.BUDGET || '9.8' }}
-          GLOSSARY: 'false'
-          REFINE: 'false'
-          TR_W: '4'
-          BATCH: '25'
-        run: |
-          python sub.py
+          GROQ_KEY: ${{ secrets.GROQ_KEY }}
+          DEEPGRAM_KEY: ${{ secrets.DEEPGRAM_KEY }}
+          DEEPSEEK_KEY: ${{ secrets.DEEPSEEK_KEY }}
+          ASR: ${{ secrets.ASR }}
+          ROOT: ${{ secrets.ROOT }}
+        run: python sub.py
