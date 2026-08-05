@@ -517,11 +517,16 @@ def _run_batches(segs, worker, label):
     print(f"    {label} {sum(1 for x in res if x)}/{n}  累计¥{COST:.2f}")
     return res
 
-def _do_translate(start, ctx, texts, res):
+def _do_translate(start, ctx, segs_block, res):
     part=None
+    
+    # 核心修复：提前把字典列表转化为纯文本字符串列表
+    texts = [s['text'] for s in segs_block]
+    
     try: part=tr_batch(texts, ctx)
     except LimitExceeded: raise
     except Exception as e: print("    批量失败,全逐行:",e)
+    
     if part is None: part=[None]*len(texts)
     for j,t in enumerate(texts):
         if _stop.is_set(): part[j]=part[j] or t; continue
@@ -529,6 +534,7 @@ def _do_translate(start, ctx, texts, res):
             try: part[j]=tr_one(t)
             except LimitExceeded: raise
             except Exception as e: print("    单行失败:",e); part[j]=t
+            
     for j,t in enumerate(part): res[start+j]=t
 
 def _do_refine(start, ctx, segs_block, res):
