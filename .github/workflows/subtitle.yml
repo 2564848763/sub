@@ -36,4 +36,5 @@ jobs:
           DEEPSEEK_KEY: ${{ secrets.DEEPSEEK_KEY }}
           ASR: ${{ secrets.ASR }}
           ROOT: ${{ secrets.ROOT }}
-        run: python sub.py
+          PYTHONUNBUFFERED: "1"  # 关键修改 1：强制无缓冲输出
+        run: python -u sub.py      # 关键修改 2：加入 -u 参数
