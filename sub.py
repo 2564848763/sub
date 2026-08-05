@@ -129,7 +129,7 @@ def req_retry(method, url, **kw):
     raise LimitExceeded("多次请求失败")
 
 def walk(rel):
-    out, norm = rel.strip("/")
+    out, norm = [], rel.strip("/")
     r = None
     for attempt in range(3):
         try:
