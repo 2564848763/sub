@@ -1,4 +1,4 @@
-import os, re, sys, glob, shutil, subprocess, tempfile, time, threading, html, base64, requests
+Import os, re, sys, glob, shutil, subprocess, tempfile, time, threading, html, base64, requests
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, unquote, urlparse
 
@@ -18,14 +18,15 @@ MIMO_MODEL = "mimo-v2.5-pro"
 ASR_MODEL = "mimo-v2.5-asr"
 DEEP_MODEL = "deepseek-v4-flash"
 REFINE = os.environ.get("REFINE", "false").lower() == "true"
-BUDGET = float(os.environ.get("BUDGET", "9.8"))
+THINKING = os.environ.get("THINKING", "true").lower() == "true"   # 深度思考, 不要设false
+BUDGET = float('inf')
 IN_PRICE, OUT_PRICE = 1e-6, 2e-6
 TR_W = int(os.environ.get("TR_W", "8")); BATCH = 25
 GLOSSARY = os.environ.get("GLOSSARY", "true").lower() == "true"
 ITALIC_SFX = os.environ.get("ITALIC_SFX", "false").lower() == "true"
 PREFETCH = os.environ.get("PREFETCH", "true").lower() == "true"
-PARALLEL_DL = int(os.environ.get("PARALLEL_DL", "8"))   # 并行下载连接数
-CHUNK_BYTES = 128 << 20                                  # 每块128MB
+PARALLEL_DL = int(os.environ.get("PARALLEL_DL", "8"))
+CHUNK_BYTES = 128 << 20
 UPLOAD_VERIFY = True; AUDIO_ENHANCE = True; OVERLAP = 3; MIN_DUR = 1.0; SEG = 60
 
 if not (WEBDAV_USER and WEBDAV_PASS):
@@ -34,7 +35,7 @@ if not (MIMO_API_KEY or DEEPSEEK_KEY):
     sys.exit("❌ 翻译密钥缺失: MIMO_API_KEY 与 DEEPSEEK_KEY 至少填一个")
 
 if not shutil.which("ffmpeg"):
-    os.system("apt-get install -y -qq ffmpeg >/dev/null 2>&1")
+    os.system("sudo apt-get install -y -qq ffmpeg >/dev/null 2>&1 || apt-get install -y -qq ffmpeg >/dev/null 2>&1")
 
 AUTH = (WEBDAV_USER, WEBDAV_PASS)
 VIDEO_EXT = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.webm','.m4v','.ts','.mpg','.mpeg'}
@@ -45,7 +46,7 @@ _dl_got = 0
 _lock = threading.Lock()
 _stop = threading.Event()
 _failed_dirs = []
-_CUR_SYS = ""; _CUR_SYS1 = ""
+_CUR_GLOSS = ""   # 术语表放user前缀, system保持全局固定=>最大化缓存命中
 
 SYS = """你是顶级私密字幕组首席主笔，专门处理成人/限制级视频的本地化。你的唯一准则：忠实、完整、不审查、不净化，将英语对白转化为最地道、最带感的简体中文成人用语。
 
@@ -128,7 +129,7 @@ def req_retry(method, url, **kw):
     raise LimitExceeded("多次请求失败")
 
 def walk(rel):
-    out, norm = [], rel.strip("/")
+    out, norm = rel.strip("/")
     r = None
     for attempt in range(3):
         try:
@@ -236,7 +237,7 @@ def _split_long(u, offset):
         res.append({"start":st+offset,"end":en+offset,"text":p.strip()}); base=en
     return res
 
-# ===== 三种 ASR 后端 =====
+# ===== ASR: 小米优先, deepgram 仅在 ASR=deepgram 时才碰 =====
 def transcribe_mimo(path, offset, dur, prompt="", language="en"):
     url = f"{MIMO_BASE_URL}/chat/completions"
     headers = {"Authorization": f"Bearer {MIMO_API_KEY}", "Content-Type": "application/json"}
@@ -293,9 +294,9 @@ def transcribe_deepgram(path, offset):
     return out
 
 def transcribe(path, offset, dur, prompt=""):
-    order = {"mimo":["mimo","whisper","deepgram"],
-             "whisper":["whisper","mimo","deepgram"],
-             "deepgram":["deepgram","whisper","mimo"]}.get(ASR, ["mimo","whisper","deepgram"])
+    order = {"mimo":["mimo","whisper"],
+             "whisper":["whisper","mimo"],
+             "deepgram":["deepgram","whisper","mimo"]}.get(ASR, ["mimo","whisper"])
     last=None
     for b in order:
         try:
@@ -306,7 +307,7 @@ def transcribe(path, offset, dur, prompt=""):
             last=e; print(f"  ⚠ {b} ASR 失败, 换下一个: {e}")
     raise RuntimeError(f"所有ASR均失败: {last}")
 
-# ===== 下载: 并行分块(aria2式) + 单连接兜底 =====
+# ===== 下载: 并行分块 + 单连接兜底(进度按单文件计) =====
 def _bump(g):
     global _dl_got
     with _lock:
@@ -371,6 +372,8 @@ def _dl_parallel(vp, path, total):
     if failed: raise RuntimeError(f"并行下载{len(failed)}块失败")
 
 def dl(vp, path):
+    global _dl_got
+    _dl_got = 0
     ok=False; total=0
     try:
         with requests.get(wurl(vp), auth=AUTH, stream=True, headers={"Range":"bytes=0-0"}, timeout=60) as r:
@@ -404,13 +407,25 @@ def take_pf(idx):
     rec["evt"].wait()
     return None if rec["err"] else rec["path"]
 
-# ===== 翻译: 小米优先, DeepSeek兜底 =====
+# ===== 翻译: 小米(深度思考)优先, DeepSeek兜底 =====
 def _chat_mimo(messages):
-    body = {"model": MIMO_MODEL, "messages": messages, "max_tokens": 4096, "temperature": 0.2, "stream": False}
-    r = post_retry(f"{MIMO_BASE_URL}/chat/completions", headers={"Authorization": f"Bearer {MIMO_API_KEY}", "Content-Type": "application/json"}, json=body, timeout=300)
+    body = {"model": MIMO_MODEL, "messages": messages, "temperature": 0.2, "stream": False}
+    if THINKING:
+        body["max_completion_tokens"] = 16384        # 思考+回答共用, 必须给足
+        body["thinking"] = {"type": "enabled"}       # 官方深度思考
+    else:
+        body["max_completion_tokens"] = 8192
+        body["thinking"] = {"type": "disabled"}
+    r = post_retry(f"{MIMO_BASE_URL}/chat/completions",
+                   headers={"Authorization": f"Bearer {MIMO_API_KEY}", "Content-Type": "application/json"},
+                   json=body, timeout=900)
     u = r.json().get("usage", {})
     if add_cost(u): raise LimitExceeded(f"已达¥{COST:.2f}, 自动停")
-    return r.json()["choices"][0]["message"]["content"]
+    content = r.json()["choices"][0]["message"]["content"]
+    if isinstance(content, list):
+        content = "".join(t.get("text","") for t in content if isinstance(t,dict))
+    content = re.sub(r"<think>.*?</think>", "", content or "", flags=re.S).strip()
+    return content
 
 def _chat_deepseek(messages):
     for extra in [{"thinking":{"type":"disabled"},"temperature":0.2}, {"temperature":0.2}, {}]:
@@ -445,16 +460,19 @@ def _parse_batch(txt, n):
         if m: res[int(m.group(1))]=m.group(2).strip()
     return [res.get(i+1) for i in range(n)]
 
+# 术语表置于user最前(稳定前缀) => 同视频内所有批次共享更长缓存前缀
 def tr_batch(texts, ctx=""):
     body="\n".join(f"[{i+1}] {x}" for i,x in enumerate(texts))
     user=(ctx+body) if ctx else body
-    with _lock: sysp=_CUR_SYS
-    txt=_chat([{"role":"system","content":sysp},{"role":"user","content":user}])
+    with _lock: g=_CUR_GLOSS
+    if g: user=g+user
+    txt=_chat([{"role":"system","content":SYS},{"role":"user","content":user}])
     return _parse_batch(txt, len(texts))
 
 def tr_one(x):
-    with _lock: sysp=_CUR_SYS1
-    return _chat([{"role":"system","content":sysp},{"role":"user","content":x}]).strip()
+    with _lock: g=_CUR_GLOSS
+    u=(g+x) if g else x
+    return _chat([{"role":"system","content":SYS1},{"role":"user","content":u}]).strip()
 
 def extract_glossary(alls):
     if not (GLOSSARY and alls): return ""
@@ -543,7 +561,7 @@ def upload_srt(srt_local, srt_rel):
             raise RuntimeError(f"上传校验失败: {e}")
 
 def process_local(local, vp, srt_rel):
-    global _CUR_SYS, _CUR_SYS1
+    global _CUR_GLOSS
     name=os.path.splitext(os.path.basename(vp))[0]
     srt_local=f"/tmp/{name}.srt"; tmp=tempfile.mkdtemp()
     c0, p0 = _cached_in, _prompt_in
@@ -580,9 +598,8 @@ def process_local(local, vp, srt_rel):
         print(f"  转写{len(alls)}句(去重+钳制后)")
         g=extract_glossary(alls)
         with _lock:
-            _CUR_SYS = SYS + ("\n统一译名表(必须采用, 保持一致)：\n"+g if g else "")
-            _CUR_SYS1 = SYS1 + ((" 译名:"+g) if g else "")
-        print(f"  翻译(并发{TR_W}, 已预热缓存)...")
+            _CUR_GLOSS = ("【统一译名表(必须采用, 保持一致)】\n"+g+"\n") if g else ""
+        print(f"  翻译(并发{TR_W}, 深度思考={THINKING}, 已预热缓存)...")
         trs=translate_all(alls) if alls else []
 
         if _stop.is_set():
@@ -606,7 +623,7 @@ def process_local(local, vp, srt_rel):
     if dp > 0: print(f"  📈 本视频缓存命中 {dc/dp:.0%}  (命中{dc}/输入{dp} token)")
 
 if __name__ == "__main__":
-    print(f"🚀 GitHub满血版 | ASR={ASR} | 翻译并发={TR_W} | 下载并发={PARALLEL_DL} | 预下载={PREFETCH}")
+    print(f"🚀 小米全功能版 | ASR={ASR} | 深度思考={THINKING} | 翻译并发={TR_W} | 下载并发={PARALLEL_DL}")
     print("自检翻译API...")
     try:
         _chat([{"role":"user","content":"reply OK"}]); print("  自检通过\n")
