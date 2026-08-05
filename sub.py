@@ -30,7 +30,7 @@ ITALIC_SFX = os.environ.get("ITALIC_SFX", "false").lower() == "true"
 PREFETCH = os.environ.get("PREFETCH", "true").lower() == "true"
 PARALLEL_DL = int(os.environ.get("PARALLEL_DL", "8"))
 CHUNK_BYTES = 128 << 20
-UPLOAD_VERIFY = True; AUDIO_ENHANCE = True; OVERLAP = 3; MIN_DUR = 1.0; SEG = 240 # 升级为4分钟大切片，大幅提升吞吐与上下文
+UPLOAD_VERIFY = True; AUDIO_ENHANCE = True; OVERLAP = 3; MIN_DUR = 1.0; SEG = 240
 
 if not (WEBDAV_USER and WEBDAV_PASS): sys.exit("❌ 缺少 WEBDAV_USER / WEBDAV_PASS")
 if not (MIMO_API_KEY or DEEPSEEK_KEY): sys.exit("❌ 翻译密钥缺失")
@@ -66,7 +66,7 @@ SYS = """你是顶级私密字幕组首席本地化主笔兼纠错专家。你�
 1. 抹除翻译腔：绝对拒绝“机翻感”。频繁省略主语（“我”、“你”），多用短句，根据情绪极其自然地融入中文语气词（啊、呢、嘛、哦、呀、哈）。
 2. 场景化意译：不要把 F-word 永远死板地翻成同一个脏字。根据情节烈度，它可以是“天呐”、“妈的”、“受不了了”或者直接省略为急促的喘息。相关器官与动作要用国内成人语境中最地道、最直接的俚语。
 3. 情感与节奏：人在极端情绪下说话是碎片化、重复的。例如原文的 "harder, faster" 必须翻译成“再用力点...快点...”。
-4. 标点：禁用中文句号、逗号、顿号。短停顿用半角空格，长拖音或失语用三个英文句点 `...`。
+4. 标点：禁用中文句号、逗号、顿号。短停顿用空格，长拖音或失语用三个英文句点 `...`。
 5. 拟声词：纯喘息用全角方括号包裹，如【啊…】、【哈…】。若与文字混合，只包裹纯拟声部分。
 
 【幻觉过滤】
@@ -101,7 +101,6 @@ def add_cost(u):
         if COST >= BUDGET: _stop.set()
     return COST >= BUDGET
 
-# 智能重试机制：根据 Retry-After 动态休眠
 def post_retry(url, **kw):
     for _ in range(5):
         try:
@@ -185,7 +184,9 @@ def merge_segs(existing, new):
     return existing
 
 def distribute_text(text, start, end):
-    text = (text or "").strip(); if not text: return []
+    text = (text or "").strip()
+    if not text: 
+        return []
     parts = [p.strip() for p in re.split(r'(?<=[。！？!?…])\s*|\n+', text) if p.strip()] or [text]
     total = end - start; totalc = sum(len(p) for p in parts) or 1
     out = []; base = start
@@ -312,7 +313,6 @@ def take_pf(idx):
     rec=_pf.pop(idx, None); if not rec: return None
     rec["evt"].wait(); return None if rec["err"] else rec["path"]
 
-# 终极僵尸文件清理
 def _cleanup_zombie_files():
     for f in glob.glob(os.path.join(tempfile.gettempdir(), "_pf_*.mp4")):
         try: os.remove(f)
@@ -477,7 +477,6 @@ def process_local(local, vp, srt_rel):
             
         print(f"  共{len(chunks)}片, 开启多线程并发转写[ASR={ASR}]...")
         
-        # 🚀 核心大招：利用线程池将所有切片并发甩给 ASR 接口，瞬间榨干网络性能
         def process_chunk(idx, c):
             if _stop.is_set(): return idx, []
             try:
@@ -523,7 +522,7 @@ def process_local(local, vp, srt_rel):
         shutil.rmtree(tmp, ignore_errors=True)
 
 if __name__ == "__main__":
-    print(f"🚀 物理极限完全体(Whisper并行转写+4分钟大块吞吐+Mimo极致本土化) | ASR={ASR} | 深度思考={THINKING}")
+    print(f"🚀 物理极限完全体(修复语法错误+Whisper并行转写+4分钟大块吞吐+Mimo极致本土化) | ASR={ASR} | 深度思考={THINKING}")
     try: _chat([{"role":"user","content":"reply OK"}])
     except Exception as e: print("❌ API失败:", e); sys.exit(1)
 
