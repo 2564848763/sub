@@ -243,9 +243,10 @@ def transcribe_mimo(path, offset, dur, prompt="", language="en"):
     headers = {"Authorization": f"Bearer {MIMO_API_KEY}", "Content-Type": "application/json"}
     with open(path, "rb") as f:
         audio_base64 = base64.b64encode(f.read()).decode("utf-8")
+    
+    # 彻底去除 text prompt，防止多模态组合导致 400 错误
     messages = [{"role":"user","content":[{"type":"input_audio","input_audio":{"data":f"data:audio/mpeg;base64,{audio_base64}"}}]}]
-    if prompt:
-        messages[0]["content"].insert(0, {"type":"text","text":prompt})
+    
     body = {"model": ASR_MODEL, "messages": messages, "asr_options": {"language": language}}
     last = None
     for attempt in range(3):
@@ -568,7 +569,9 @@ def process_local(local, vp, srt_rel):
     try:
         print("  抽音频+切片(满血增强+重叠)...")
         dur = probe_dur(local)
-        af = "highpass=f=80,loudnorm=I=-16:TP=-1.5:LRA=11" if AUDIO_ENHANCE else "anull"
+        
+        # 发烧级音频滤镜配置
+        af = "afftdn=nf=-25,highpass=f=100,lowpass=f=8000,loudnorm=I=-16:TP=-1.5:LRA=11" if AUDIO_ENHANCE else "anull"
         chunks=[]; offsets=[]; durs=[]
         if dur>0:
             n = int(dur//SEG) + (1 if dur%SEG>1 else 0)
@@ -577,15 +580,16 @@ def process_local(local, vp, srt_rel):
                 st = max(0.0, i*SEG - ov)
                 ln = SEG + ov
                 cp = os.path.join(tmp,f"c_{i:03d}.mp3")
-                subprocess.run(["ffmpeg","-y","-ss",str(st),"-i",local,"-t",str(ln),"-vn","-ac","1","-ar","16000","-b:a","64k","-af",af,"-c:a","libmp3lame",cp],
+                subprocess.run(["ffmpeg","-y","-ss",str(st),"-i",local,"-t",str(ln),"-vn","-ac","1","-ar","16000","-b:a","128k","-af",af,"-c:a","libmp3lame",cp],
                                check=True, capture_output=True)
                 chunks.append(cp); offsets.append(st); durs.append(ln)
         else:
-            subprocess.run(["ffmpeg","-y","-i",local,"-vn","-ac","1","-ar","16000","-b:a","64k",
-                "-f","segment","-segment_time",str(SEG),"-c:a","libmp3lame",os.path.join(tmp,"c_%03d.mp3")],
+            subprocess.run(["ffmpeg","-y","-i",local,"-vn","-ac","1","-ar","16000","-b:a","128k",
+                "-f","segment","-segment_time",str(SEG),"-af",af,"-c:a","libmp3lame",os.path.join(tmp,"c_%03d.mp3")],
                 check=True, capture_output=True)
             chunks=sorted(glob.glob(os.path.join(tmp,"c_*.mp3")))
             offsets=[i*SEG for i in range(len(chunks))]; durs=[SEG for _ in chunks]
+            
         print(f"  共{len(chunks)}片, 转写[ASR={ASR}]...")
         alls=[]; last_prompt=""
         for idx,c in enumerate(chunks):
