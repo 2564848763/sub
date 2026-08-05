@@ -12,20 +12,24 @@ jobs:
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
+      
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          
       - name: install deps
         run: |
           pip install -q requests
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
+          
       - name: enable BBR
         run: |
           sudo modprobe tcp_bbr || true
           sudo sysctl -w net.core.default_qdisc=fq || true
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
           sysctl net.ipv4.tcp_congestion_control || true
+          
       - name: run subtitle
         env:
           WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
@@ -36,5 +40,13 @@ jobs:
           DEEPSEEK_KEY: ${{ secrets.DEEPSEEK_KEY }}
           ASR: ${{ secrets.ASR }}
           ROOT: ${{ secrets.ROOT }}
-          PYTHONUNBUFFERED: "1"  # 关键修改 1：强制无缓冲输出
-        run: python -u sub.py      # 关键修改 2：加入 -u 参数
+          
+          # ================= 核心黑科技开关 =================
+          PYTHONUNBUFFERED: "1"  # 强制实时输出日志，防止 Actions 控制台假死
+          REFINE: "true"         # 开启二度润色：抹除机翻感，极致本土化
+          THINKING: "true"       # 开启深度思考：增强大模型逻辑与意译能力
+          TR_W: "8"              # 翻译并发数（8 线程火力全开）
+          PARALLEL_DL: "8"       # 123云盘多线程并发下载数
+          # ==================================================
+          
+        run: python -u sub.py
